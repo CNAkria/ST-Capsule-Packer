@@ -1,13 +1,77 @@
-// ST Capsule Packer — Full Character + Preset + Regex + Multi-Worldbook + All Chats Exporter & Restorer
-import { extension_settings } from '../../../extensions.js';
-import { getPresetManager } from '../../../preset-manager.js';
-import { power_user } from '../../../power-user.js';
-import { world_info } from '../../../world-info.js';
-
+// ST Capsule Packer v1.2.0 — Full Compatibility with Luker (Android/Desktop) & SillyTavern
 const EXT_ID = 'ST-Capsule-Packer';
 
+// Self-inject critical fallback CSS so hot-install in Luker works even before style.css is reloaded
+function ensureCriticalStyles() {
+    if (document.getElementById('stcap-critical-css')) return;
+    const style = document.createElement('style');
+    style.id = 'stcap-critical-css';
+    style.textContent = `
+      dialog.stcap-dialog { padding:0; margin:auto; border:none; background:transparent; width:min(920px,96vw); max-width:96vw; max-height:92dvh; color:#f2f2f7; z-index:2147483645; }
+      dialog.stcap-dialog::backdrop { background:rgba(6,7,11,0.82); backdrop-filter:blur(6px); }
+      .stcap-overlay-fallback { position:fixed !important; inset:0 !important; z-index:2147483645 !important; background:rgba(6,7,11,0.82); display:flex; align-items:center; justify-content:center; padding:10px; box-sizing:border-box; }
+      .stcap-modal { width:100%; max-height:90dvh; display:flex; flex-direction:column; background:#101219; border:1px solid rgba(218,228,255,0.2); border-radius:14px; box-shadow:0 24px 64px rgba(0,0,0,0.85); color:#f2f2f7; overflow:hidden; box-sizing:border-box; }
+      .stcap-body { padding:14px 16px; overflow-y:auto; -webkit-overflow-scrolling:touch; flex:1; display:flex; flex-direction:column; gap:12px; }
+      .stcap-footer { padding:10px 16px; border-top:1px solid rgba(255,255,255,0.1); background:#0b0d12; display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; }
+      .stcap-trigger-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:8px 13px; min-height:38px; border-radius:8px; border:1px solid rgba(102,157,246,0.55); background:#1a1e2c; color:#f4f4f8 !important; font-weight:600; font-size:13px; cursor:pointer; }
+    `;
+    document.head.appendChild(style);
+}
+
 // ============================================================================
-// Pure Browser PNG Chunk & GZIP Codec (Zero External Dependencies)
+// Dynamic Host Module Bridge (Works on Luker + Vanilla SillyTavern safely)
+// ============================================================================
+let hostMods = null;
+
+async function getHostMods() {
+    if (hostMods) return hostMods;
+    const safeImport = async (relPath) => {
+        try {
+            return await import(new URL(relPath, import.meta.url).href);
+        } catch (e1) {
+            try {
+                const absPath = relPath.replace(/^(\.\.\/)+/, '/scripts/');
+                return await import(absPath);
+            } catch {
+                return {};
+            }
+        }
+    };
+
+    const [extMod, pmMod, puMod, wiMod, openaiMod] = await Promise.all([
+        safeImport('../../../extensions.js'),
+        safeImport('../../../preset-manager.js'),
+        safeImport('../../../power-user.js'),
+        safeImport('../../../world-info.js'),
+        safeImport('../../../openai.js'),
+    ]);
+
+    hostMods = { extMod, pmMod, puMod, wiMod, openaiMod };
+    return hostMods;
+}
+
+function getCtx() {
+    try {
+        if (window.Luker?.getContext) return window.Luker.getContext() || {};
+        if (window.SillyTavern?.getContext) return window.SillyTavern.getContext() || {};
+        if (window.lukerContext) return window.lukerContext;
+    } catch (e) {
+        console.warn('[ST-Capsule] getContext fallback:', e);
+    }
+    return {};
+}
+
+function safeJsonClone(val, fallback = {}) {
+    if (val === undefined || val === null) return fallback;
+    try {
+        return JSON.parse(JSON.stringify(val));
+    } catch {
+        return fallback;
+    }
+}
+
+// ============================================================================
+// Pure Browser PNG Chunk & GZIP Codec
 // ============================================================================
 const PNG_SIG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 
@@ -151,6 +215,9 @@ async function compressCapsulePayload(jsonStr) {
 
 async function decompressCapsulePayload(payloadStr) {
     if (payloadStr.startsWith('STCAP1:GZIP:')) {
+        if (typeof DecompressionStream === 'undefined') {
+            throw new Error('当前 WebView 内核不支持 GZIP 解压，请升级 Android System WebView 或使用 .stcapsule.json。');
+        }
         const b64 = payloadStr.slice('STCAP1:GZIP:'.length);
         const compressed = base64ToUint8(b64);
         const ds = new DecompressionStream('gzip');
@@ -229,7 +296,7 @@ async function parseAnyCapsuleOrCardFile(file) {
             type: 'card_only',
             capsule: {
                 spec: 'st_capsule_v1',
-                version: '1.0.0',
+                version: '1.2.0',
                 exported_at: new Date().toISOString(),
                 character: {
                     name: card?.data?.name || card?.name || file.name.replace(/\.png$/i, ''),
@@ -263,7 +330,7 @@ async function parseAnyCapsuleOrCardFile(file) {
             type: 'card_only',
             capsule: {
                 spec: 'st_capsule_v1',
-                version: '1.0.0',
+                version: '1.2.0',
                 character: { name: parsed?.data?.name || parsed?.name || 'Character', card: parsed },
                 presets: { items: [] },
                 regex: { global: [], scoped: parsed?.data?.extensions?.regex_scripts || [], preset: [] },
@@ -273,16 +340,12 @@ async function parseAnyCapsuleOrCardFile(file) {
             },
         };
     }
-    throw new Error('无法识别的文件格式，请拖入 .capsule.png、普通角色卡 .png 或 .stcapsule.json。');
+    throw new Error('无法识别的文件格式，请选入 .capsule.png、普通角色卡 .png 或 .stcapsule.json。');
 }
 
 // ============================================================================
-// SillyTavern Data Collectors & Restorers
+// Data Collectors & Native Luker Android Save Handoff
 // ============================================================================
-function getCtx() {
-    return window.SillyTavern?.getContext?.() || {};
-}
-
 async function apiPost(url, body) {
     const ctx = getCtx();
     const headers = ctx.getRequestHeaders ? ctx.getRequestHeaders() : { 'Content-Type': 'application/json' };
@@ -308,38 +371,40 @@ async function createFallbackPngBytes(label = 'ST') {
     g.fillStyle = '#669df6';
     g.font = 'bold 42px sans-serif';
     g.textAlign = 'center';
-    g.fillText(label.slice(0, 12), 256, 384);
+    g.fillText(String(label || 'ST').slice(0, 12), 256, 384);
     const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
     return new Uint8Array(await blob.arrayBuffer());
 }
 
 async function fetchCharacterAvatarBytes(avatar) {
-    try {
-        const resp = await fetch(`/characters/${encodeURIComponent(avatar)}`, { cache: 'no-store' });
-        if (resp.ok) {
-            const buf = new Uint8Array(await resp.arrayBuffer());
-            if (buf.length > 8 && buf[0] === 137 && buf[1] === 80) return buf;
+    if (avatar) {
+        try {
+            const resp = await fetch(`/characters/${encodeURIComponent(avatar)}`, { cache: 'no-store' });
+            if (resp.ok) {
+                const buf = new Uint8Array(await resp.arrayBuffer());
+                if (buf.length > 8 && buf[0] === 137 && buf[1] === 80) return buf;
+            }
+        } catch (e) {
+            console.warn('[ST-Capsule] Avatar fetch fallback:', e);
         }
-    } catch (e) {
-        console.warn('[ST-Capsule] Avatar fetch fallback:', e);
     }
-    return await createFallbackPngBytes(avatar);
+    return await createFallbackPngBytes(avatar || 'Card');
 }
 
 function buildStandardV2Card(charObj) {
-    const data = structuredClone(charObj.data || {});
-    data.name = data.name || charObj.name || '';
-    data.description = data.description ?? charObj.description ?? '';
-    data.personality = data.personality ?? charObj.personality ?? '';
-    data.scenario = data.scenario ?? charObj.scenario ?? '';
-    data.first_mes = data.first_mes ?? charObj.first_mes ?? '';
-    data.mes_example = data.mes_example ?? charObj.mes_example ?? '';
-    data.creator_notes = data.creator_notes ?? charObj.creatorcomment ?? '';
-    data.tags = Array.isArray(data.tags) ? data.tags : (Array.isArray(charObj.tags) ? charObj.tags : []);
+    const data = safeJsonClone(charObj?.data, {});
+    data.name = data.name || charObj?.name || '';
+    data.description = data.description ?? charObj?.description ?? '';
+    data.personality = data.personality ?? charObj?.personality ?? '';
+    data.scenario = data.scenario ?? charObj?.scenario ?? '';
+    data.first_mes = data.first_mes ?? charObj?.first_mes ?? '';
+    data.mes_example = data.mes_example ?? charObj?.mes_example ?? '';
+    data.creator_notes = data.creator_notes ?? charObj?.creatorcomment ?? '';
+    data.tags = Array.isArray(data.tags) ? data.tags : (Array.isArray(charObj?.tags) ? safeJsonClone(charObj.tags, []) : []);
     data.alternate_greetings = Array.isArray(data.alternate_greetings) ? data.alternate_greetings : [];
     data.extensions = data.extensions || {};
-    if (charObj.fav !== undefined) data.extensions.fav = Boolean(charObj.fav);
-    if (charObj.talkativeness !== undefined) data.extensions.talkativeness = charObj.talkativeness;
+    if (charObj?.fav !== undefined) data.extensions.fav = Boolean(charObj.fav);
+    if (charObj?.talkativeness !== undefined) data.extensions.talkativeness = charObj.talkativeness;
 
     return {
         name: data.name,
@@ -350,9 +415,9 @@ function buildStandardV2Card(charObj) {
         mes_example: data.mes_example,
         creatorcomment: data.creator_notes || '',
         avatar: 'none',
-        chat: charObj.chat || '',
-        talkativeness: String(charObj.talkativeness ?? '0.5'),
-        fav: Boolean(charObj.fav),
+        chat: charObj?.chat || '',
+        talkativeness: String(charObj?.talkativeness ?? '0.5'),
+        fav: Boolean(charObj?.fav),
         tags: data.tags,
         spec: 'chara_card_v2',
         spec_version: '2.0',
@@ -360,8 +425,21 @@ function buildStandardV2Card(charObj) {
     };
 }
 
+function normalizeChatMessagesResponse(resp) {
+    if (Array.isArray(resp)) return resp;
+    if (resp && Array.isArray(resp.chat)) return resp.chat;
+    if (resp && Array.isArray(resp.messages)) return resp.messages;
+    return null;
+}
+
 async function inspectCharacterWorkspace(chid) {
     const ctx = getCtx();
+    const { extMod, pmMod, puMod, wiMod, openaiMod } = await getHostMods();
+    const extension_settings = extMod.extension_settings || ctx.extensionSettings || {};
+    const power_user = puMod.power_user || ctx.powerUserSettings || {};
+    const world_info = wiMod.world_info || {};
+    const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
+
     const characters = ctx.characters || [];
     if (chid === undefined || chid === null || !characters[chid]) {
         return null;
@@ -370,16 +448,18 @@ async function inspectCharacterWorkspace(chid) {
         try { await ctx.unshallowCharacter(chid); } catch (e) { console.warn('[ST-Capsule] unshallow warning:', e); }
     }
     const charObj = characters[chid];
-    const avatar = charObj.avatar;
-    const charKey = String(avatar || '').replace(/\.png$/i, '');
+    const avatar = charObj.avatar || '';
+    const charKey = String(avatar).replace(/\.png$/i, '');
 
-    // 1. Worldbooks discovery
+    // 1. Worldbooks discovery (Supports both Luker & Vanilla SillyTavern)
     let allWorldList = [];
     try {
         const wiResp = await apiPost('/api/worldinfo/list', {});
-        allWorldList = Array.isArray(wiResp) ? wiResp.map(w => w.file_id || w.name).filter(Boolean) : [];
-    } catch (e) {
-        console.warn('[ST-Capsule] worldinfo/list error:', e);
+        if (Array.isArray(wiResp)) {
+            allWorldList = wiResp.map(w => (typeof w === 'string' ? w : (w?.file_id || w?.name))).filter(Boolean);
+        }
+    } catch {
+        if (Array.isArray(wiMod.world_names)) allWorldList = [...wiMod.world_names];
     }
 
     const roleMap = new Map();
@@ -392,18 +472,33 @@ async function inspectCharacterWorkspace(chid) {
     const primaryBook = charObj?.data?.extensions?.world || charObj?.world || null;
     if (primaryBook) addBookRole(primaryBook, '角色主世界书');
 
+    // Luker getCharaAuxWorlds support
+    if (typeof wiMod.getCharaAuxWorlds === 'function') {
+        try {
+            const aux = wiMod.getCharaAuxWorlds(avatar) || wiMod.getCharaAuxWorlds(charKey) || [];
+            if (Array.isArray(aux)) aux.forEach(b => addBookRole(b, '角色附加世界书'));
+        } catch {}
+    }
+
     const charLoreArr = world_info?.charLore || [];
-    const extraEntry = charLoreArr.find(e => e.name === charKey || e.name === avatar);
+    const extraEntry = Array.isArray(charLoreArr) ? charLoreArr.find(e => e.name === charKey || e.name === avatar) : null;
     if (Array.isArray(extraEntry?.extraBooks)) {
         extraEntry.extraBooks.forEach(b => addBookRole(b, '角色附加世界书'));
     }
 
-    const globalBooks = world_info?.globalSelect || [];
+    const globalBooks = world_info?.globalSelect || wiMod.selected_world_info || [];
     if (Array.isArray(globalBooks)) {
         globalBooks.forEach(b => addBookRole(b, '全局启用世界书'));
     }
 
-    // WorldInfoLocks plugin support
+    // Luker getChatWorldInfoNames support
+    if (ctx.characterId == chid && typeof wiMod.getChatWorldInfoNames === 'function') {
+        try {
+            const cw = wiMod.getChatWorldInfoNames();
+            if (Array.isArray(cw)) cw.forEach(b => addBookRole(b, '当前聊天绑定'));
+        } catch {}
+    }
+
     const wiLocks = extension_settings?.worldInfoPresets;
     const lockedPresetName = wiLocks?.characterLocks?.[avatar] || wiLocks?.characterLocks?.[charKey];
     if (lockedPresetName && Array.isArray(wiLocks?.presetList)) {
@@ -413,7 +508,6 @@ async function inspectCharacterWorkspace(chid) {
         }
     }
 
-    // Persona lorebook
     const userAvatar = power_user?.personas ? Object.keys(power_user.personas).find(k => power_user.personas[k] === ctx.name1) : null;
     const personaBook = userAvatar ? power_user?.persona_descriptions?.[userAvatar]?.lorebook : null;
     if (personaBook) addBookRole(personaBook, '当前人设世界书');
@@ -435,21 +529,18 @@ async function inspectCharacterWorkspace(chid) {
                     message_count: c.chat_items ?? c.message_count ?? 0,
                     file_size: c.file_size || '',
                     last_mes: c.last_mes || '',
-                    mes_preview: (c.mes || '').slice(0, 80),
                     is_active: fileId === charObj.chat,
                 };
-            });
+            }).filter(c => c.file_id);
         }
     } catch (e) {
-        console.warn('[ST-Capsule] characters/chats error:', e);
+        console.warn('[ST-Capsule] characters/chats warning:', e);
     }
 
-    // Also check active chat metadata worldbook
     if (ctx.characterId == chid && ctx.chatMetadata?.world_info) {
         addBookRole(ctx.chatMetadata.world_info, '当前聊天绑定');
     }
 
-    // Merge bound books + all other available books
     const worldbookOptions = [];
     for (const [name, roles] of roleMap.entries()) {
         worldbookOptions.push({ name, roles: [...roles], preselected: true });
@@ -460,8 +551,8 @@ async function inspectCharacterWorkspace(chid) {
         }
     }
 
-    // 3. Presets discovery
-    const pm = getPresetManager?.();
+    // 3. Presets discovery (Luker + Vanilla ST safe)
+    const pm = typeof getPresetManager === 'function' ? getPresetManager() : null;
     let activePresetName = '';
     let presetNames = [];
     try {
@@ -477,6 +568,9 @@ async function inspectCharacterWorkspace(chid) {
     } catch (e) {
         console.warn('[ST-Capsule] Preset list warning:', e);
     }
+    if (!activePresetName && openaiMod?.oai_settings?.preset_settings_openai) {
+        activePresetName = String(openaiMod.oai_settings.preset_settings_openai);
+    }
     if (activePresetName && !presetNames.includes(activePresetName)) {
         presetNames.unshift(activePresetName);
     }
@@ -486,7 +580,7 @@ async function inspectCharacterWorkspace(chid) {
     const scopedRegex = Array.isArray(charObj?.data?.extensions?.regex_scripts) ? charObj.data.extensions.regex_scripts : [];
     let presetRegex = [];
     try {
-        const activePresetData = pm?.getPresetSettings?.(activePresetName);
+        const activePresetData = pm?.getPresetSettings?.(activePresetName) || openaiMod?.oai_settings;
         if (Array.isArray(activePresetData?.extensions?.regex_scripts)) {
             presetRegex = activePresetData.extensions.regex_scripts;
         }
@@ -500,7 +594,7 @@ async function inspectCharacterWorkspace(chid) {
         charObj,
         avatar,
         charKey,
-        name: charObj.name,
+        name: charObj.name || charKey || 'Character',
         worldbookOptions,
         chatFiles,
         activePresetName,
@@ -508,8 +602,8 @@ async function inspectCharacterWorkspace(chid) {
         globalRegex,
         scopedRegex,
         presetRegex,
-        thGlobalScripts: Array.isArray(thGlobalScripts) ? thGlobalScripts : Object.values(thGlobalScripts),
-        thCharScripts: Array.isArray(thCharScripts) ? thCharScripts : Object.values(thCharScripts),
+        thGlobalScripts: Array.isArray(thGlobalScripts) ? thGlobalScripts : Object.values(thGlobalScripts || {}),
+        thCharScripts: Array.isArray(thCharScripts) ? thCharScripts : Object.values(thCharScripts || {}),
     };
 }
 
@@ -525,6 +619,10 @@ function sanitizeDownloadName(name) {
     return String(name || 'Character').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'Character';
 }
 
+function isLukerAndroidApp() {
+    return Boolean(window.LukerAndroid && typeof window.LukerAndroid.saveFileFromDataUrl === 'function');
+}
+
 function canShareFileMobile() {
     try {
         if (typeof navigator !== 'undefined' && navigator.canShare && typeof File !== 'undefined') {
@@ -535,22 +633,37 @@ function canShareFileMobile() {
     return false;
 }
 
-async function triggerBlobDownload(blob, filename, useMobileShare = false) {
+async function saveGeneratedPayload({ bytes, filename, mimeType, useMobileShare = false }) {
+    const blob = new Blob([bytes], { type: mimeType });
+
+    // 1. Explicit Web Share sheet if user clicked Share button
     if (useMobileShare && navigator.share && typeof File !== 'undefined') {
         try {
-            const fileObj = new File([blob], filename, { type: blob.type || 'application/octet-stream' });
+            const fileObj = new File([blob], filename, { type: mimeType });
             if (!navigator.canShare || navigator.canShare({ files: [fileObj] })) {
-                await navigator.share({
-                    title: filename,
-                    files: [fileObj],
-                });
-                return;
+                await navigator.share({ title: filename, files: [fileObj] });
+                return { via: 'share', blob };
             }
         } catch (err) {
-            if (err?.name === 'AbortError') return;
-            console.warn('[ST-Capsule] Share fallback to download:', err);
+            if (err?.name === 'AbortError') return { via: 'cancelled', blob };
+            console.warn('[ST-Capsule] Share fallback:', err);
         }
     }
+
+    // 2. Native Luker Android Bridge (MainActivity.kt -> LukerAndroid.saveFileFromDataUrl -> Android SAF Save Dialog)
+    if (isLukerAndroidApp()) {
+        try {
+            const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(await blob.arrayBuffer());
+            const b64 = uint8ToBase64(u8);
+            const dataUrl = `data:${mimeType};base64,${b64}`;
+            window.LukerAndroid.saveFileFromDataUrl(dataUrl, filename, mimeType);
+            return { via: 'luker-android-saf', blob };
+        } catch (err) {
+            console.warn('[ST-Capsule] LukerAndroid bridge fallback to anchor:', err);
+        }
+    }
+
+    // 3. Standard Browser Anchor Download
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -560,14 +673,74 @@ async function triggerBlobDownload(blob, filename, useMobileShare = false) {
     setTimeout(() => {
         a.remove();
         URL.revokeObjectURL(url);
-    }, 2500);
+    }, 15000);
+    return { via: 'browser-download', blob };
 }
 
 // ============================================================================
-// Interactive Modal UI (Export & Restore)
+// Top-Layer <dialog> Modal UI (Guaranteed Visible Above All Luker Layers)
 // ============================================================================
+function createTopLayerModalShell(initialTab) {
+    document.querySelectorAll('.stcap-dialog, .stcap-overlay-fallback').forEach(el => {
+        try { if (typeof el.close === 'function' && el.open) el.close(); } catch {}
+        el.remove();
+    });
+
+    const supportsDialog = typeof HTMLDialogElement !== 'undefined' && typeof HTMLDialogElement.prototype.showModal === 'function';
+    const rootEl = document.createElement(supportsDialog ? 'dialog' : 'div');
+    rootEl.className = supportsDialog ? 'stcap-dialog' : 'stcap-overlay-fallback';
+    rootEl.innerHTML = `
+      <div class="stcap-modal">
+        <div class="stcap-hazard-bar"></div>
+        <div class="stcap-header">
+          <div class="stcap-title-wrap">
+            <span class="stcap-title">📦 酒馆全量胶囊工作台</span>
+            <span class="stcap-neon-tag">${isLukerAndroidApp() ? 'Luker Android 直连' : 'ST-CAPSULE v1.2'}</span>
+          </div>
+          <button type="button" class="stcap-close" title="关闭">✕</button>
+        </div>
+        <div class="stcap-tabs">
+          <button type="button" class="stcap-tab ${initialTab === 'export' ? 'active' : ''}" data-tab="export">📤 绑定打包导出</button>
+          <button type="button" class="stcap-tab ${initialTab === 'import' ? 'active' : ''}" data-tab="import">📥 读取 / 还原胶囊</button>
+        </div>
+        <div class="stcap-body" id="stcap-body">
+          <div style="padding:24px;text-align:center;color:#8ab4f8;">正在打开胶囊工作台...</div>
+        </div>
+        <div class="stcap-footer" id="stcap-footer"></div>
+      </div>
+    `;
+
+    document.body.appendChild(rootEl);
+    if (supportsDialog) {
+        try {
+            rootEl.showModal();
+        } catch {
+            rootEl.className = 'stcap-overlay-fallback';
+        }
+    }
+
+    const closeModal = () => {
+        try { if (typeof rootEl.close === 'function' && rootEl.open) rootEl.close(); } catch {}
+        rootEl.remove();
+    };
+
+    rootEl.querySelector('.stcap-close').addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        closeModal();
+    });
+    rootEl.addEventListener('click', (e) => {
+        if (e.target === rootEl) closeModal();
+    });
+
+    return { rootEl, closeModal };
+}
+
 async function openCapsuleModal(initialTab = 'export') {
-    document.querySelectorAll('.stcap-overlay').forEach(el => el.remove());
+    ensureCriticalStyles();
+    const { rootEl } = createTopLayerModalShell(initialTab);
+    const bodyEl = rootEl.querySelector('#stcap-body');
+    const footerEl = rootEl.querySelector('#stcap-footer');
 
     const ctx = getCtx();
     const characters = ctx.characters || [];
@@ -575,213 +748,201 @@ async function openCapsuleModal(initialTab = 'export') {
         ? Number(ctx.characterId)
         : (characters.length > 0 ? 0 : -1);
 
-    const overlay = document.createElement('div');
-    overlay.className = 'stcap-overlay';
-    overlay.innerHTML = `
-      <div class="stcap-modal">
-        <div class="stcap-hazard-bar"></div>
-        <div class="stcap-header">
-          <div class="stcap-title-wrap">
-            <span class="stcap-title">📦 酒馆全量胶囊工作台 (ST Capsule Studio)</span>
-            <span class="stcap-neon-tag">ST-CAPSULE v1.0</span>
-          </div>
-          <button class="stcap-close" title="关闭">✕</button>
-        </div>
-        <div class="stcap-tabs">
-          <button class="stcap-tab ${initialTab === 'export' ? 'active' : ''}" data-tab="export">📤 绑定打包导出</button>
-          <button class="stcap-tab ${initialTab === 'import' ? 'active' : ''}" data-tab="import">📥 读取 / 还原胶囊</button>
-        </div>
-        <div class="stcap-body" id="stcap-body"></div>
-        <div class="stcap-footer" id="stcap-footer"></div>
-      </div>
-    `;
-    document.body.appendChild(overlay);
-
-    overlay.querySelector('.stcap-close').addEventListener('click', () => overlay.remove());
-    overlay.addEventListener('click', (e) => {
-        if (e.target === overlay) overlay.remove();
-    });
-
     let activeTab = initialTab;
     let inspected = null;
-    let loadedImport = null;
 
-    const bodyEl = overlay.querySelector('#stcap-body');
-    const footerEl = overlay.querySelector('#stcap-footer');
-
-    overlay.querySelectorAll('.stcap-tab').forEach(btn => {
-        btn.addEventListener('click', async () => {
+    rootEl.querySelectorAll('.stcap-tab').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.preventDefault();
             activeTab = btn.dataset.tab;
-            overlay.querySelectorAll('.stcap-tab').forEach(b => b.classList.toggle('active', b === btn));
+            rootEl.querySelectorAll('.stcap-tab').forEach(b => b.classList.toggle('active', b === btn));
             if (activeTab === 'export') await renderExportTab();
             else renderImportTab();
         });
     });
 
     async function renderExportTab() {
-        if (characters.length === 0 || currentChid < 0) {
-            bodyEl.innerHTML = `<div style="padding:28px;text-align:center;color:#94a3b8;">当前酒馆中暂无可导出的角色卡。</div>`;
+        try {
+            if (characters.length === 0 || currentChid < 0) {
+                bodyEl.innerHTML = `<div style="padding:28px;text-align:center;color:#94a3b8;">当前酒馆中暂无可导出的角色卡（如果你刚打开酒馆，请先点进任意角色或等待角色列表加载完成）。</div>`;
+                footerEl.innerHTML = '';
+                return;
+            }
+            bodyEl.innerHTML = `<div style="padding:28px;text-align:center;color:#8ab4f8;">正在扫描角色绑定的预设、正则、多世界书与全部聊天分支...</div>`;
             footerEl.innerHTML = '';
-            return;
-        }
-        bodyEl.innerHTML = `<div style="padding:28px;text-align:center;color:#8ab4f8;">正在扫描角色绑定的预设、正则、多世界书与全部聊天分支...</div>`;
-        footerEl.innerHTML = '';
 
-        inspected = await inspectCharacterWorkspace(currentChid);
-        if (!inspected) return;
+            inspected = await inspectCharacterWorkspace(currentChid);
+            if (!inspected) {
+                bodyEl.innerHTML = `<div style="padding:28px;text-align:center;color:#f87171;">无法读取角色索引 #${currentChid}。</div>`;
+                return;
+            }
 
-        const charOptionsHtml = characters.map((c, idx) =>
-            `<option value="${idx}" ${idx === currentChid ? 'selected' : ''}>${escapeHtml(c.name)} (${escapeHtml(c.avatar)})</option>`
-        ).join('');
+            const charOptionsHtml = characters.map((c, idx) =>
+                `<option value="${idx}" ${idx === currentChid ? 'selected' : ''}>${escapeHtml(c.name || c.avatar)} (${escapeHtml(c.avatar || idx)})</option>`
+            ).join('');
 
-        const wbItemsHtml = inspected.worldbookOptions.map(wb => `
-          <label class="stcap-item stcap-wb-row" data-name="${escapeHtml(wb.name.toLowerCase())}">
-            <input type="checkbox" class="stcap-wb-chk" value="${escapeHtml(wb.name)}" ${wb.preselected ? 'checked' : ''} />
-            <span class="stcap-item-label" title="${escapeHtml(wb.name)}">${escapeHtml(wb.name)}</span>
-            ${wb.roles.length ? `<span class="stcap-badge warn">${escapeHtml(wb.roles.join(' · '))}</span>` : `<span class="stcap-item-sub">未绑定</span>`}
-          </label>
-        `).join('');
-
-        const presetItemsHtml = inspected.presetNames.map(pName => {
-            const isAct = pName === inspected.activePresetName;
-            return `
-              <label class="stcap-item">
-                <input type="checkbox" class="stcap-preset-chk" value="${escapeHtml(pName)}" ${isAct ? 'checked' : ''} />
-                <span class="stcap-item-label" title="${escapeHtml(pName)}">${escapeHtml(pName)}</span>
-                ${isAct ? `<span class="stcap-badge">当前激活</span>` : ''}
+            const wbItemsHtml = inspected.worldbookOptions.map(wb => `
+              <label class="stcap-item stcap-wb-row" data-name="${escapeHtml(wb.name.toLowerCase())}">
+                <input type="checkbox" class="stcap-wb-chk" value="${escapeHtml(wb.name)}" ${wb.preselected ? 'checked' : ''} />
+                <span class="stcap-item-label" title="${escapeHtml(wb.name)}">${escapeHtml(wb.name)}</span>
+                ${wb.roles.length ? `<span class="stcap-badge warn">${escapeHtml(wb.roles.join(' · '))}</span>` : `<span class="stcap-item-sub">未绑定</span>`}
               </label>
+            `).join('');
+
+            const presetItemsHtml = inspected.presetNames.map(pName => {
+                const isAct = pName === inspected.activePresetName;
+                return `
+                  <label class="stcap-item">
+                    <input type="checkbox" class="stcap-preset-chk" value="${escapeHtml(pName)}" ${isAct ? 'checked' : ''} />
+                    <span class="stcap-item-label" title="${escapeHtml(pName)}">${escapeHtml(pName)}</span>
+                    ${isAct ? `<span class="stcap-badge">当前激活</span>` : ''}
+                  </label>
+                `;
+            }).join('');
+
+            const chatItemsHtml = inspected.chatFiles.length > 0
+                ? inspected.chatFiles.map(cf => `
+                  <label class="stcap-item">
+                    <input type="checkbox" class="stcap-chat-chk" value="${escapeHtml(cf.file_id)}" checked />
+                    <span class="stcap-item-label" title="${escapeHtml(cf.file_id)}">${escapeHtml(cf.file_id)}</span>
+                    <span class="stcap-item-sub">${cf.is_active ? '★当前 · ' : ''}${cf.message_count} 条 ${cf.file_size ? `· ${escapeHtml(cf.file_size)}` : ''}</span>
+                  </label>
+                `).join('')
+                : `<div style="color:#64748b;font-size:12px;padding:8px;">该角色暂无已保存的历史聊天记录 (.jsonl)</div>`;
+
+            bodyEl.innerHTML = `
+              <div class="stcap-char-bar">
+                <img class="stcap-avatar-preview" src="/characters/${encodeURIComponent(inspected.avatar)}" onerror="this.style.display='none'" />
+                <div style="flex:1;min-width:200px;">
+                  <div style="font-size:12px;color:#94a3b8;margin-bottom:4px;">选择要打包的角色卡（已自动勾选其绑定的世界书、预设、正则与全部聊天记录）</div>
+                  <select class="stcap-select" id="stcap-char-select">${charOptionsHtml}</select>
+                </div>
+              </div>
+
+              <div class="stcap-grid">
+                <div class="stcap-section">
+                  <div class="stcap-section-head">
+                    <span class="stcap-section-title">🌍 多本世界书 <span class="stcap-badge">${inspected.worldbookOptions.filter(w => w.preselected).length} 绑定 / 共 ${inspected.worldbookOptions.length}</span></span>
+                    <div class="stcap-mini-actions">
+                      <button type="button" class="stcap-mini-btn" id="stcap-wb-bound">仅绑定</button>
+                      <button type="button" class="stcap-mini-btn" id="stcap-wb-all">全选</button>
+                      <button type="button" class="stcap-mini-btn" id="stcap-wb-none">清空</button>
+                    </div>
+                  </div>
+                  <input type="text" class="stcap-search" id="stcap-wb-search" placeholder="搜索世界书名称（可勾选任意多本一起打包）..." />
+                  <div class="stcap-list" id="stcap-wb-list">${wbItemsHtml || '<div style="color:#64748b;font-size:12px;padding:6px;">暂无世界书</div>'}</div>
+                </div>
+
+                <div class="stcap-section">
+                  <div class="stcap-section-head">
+                    <span class="stcap-section-title">💬 所有聊天记录 <span class="stcap-badge">${inspected.chatFiles.length} 个分支</span></span>
+                    <div class="stcap-mini-actions">
+                      <button type="button" class="stcap-mini-btn" id="stcap-chat-all">全选</button>
+                      <button type="button" class="stcap-mini-btn" id="stcap-chat-none">清空</button>
+                    </div>
+                  </div>
+                  <div class="stcap-list">${chatItemsHtml}</div>
+                </div>
+
+                <div class="stcap-section">
+                  <div class="stcap-section-head">
+                    <span class="stcap-section-title">🎛️ 预设 (Presets) <span class="stcap-badge">${escapeHtml(ctx.mainApi || 'Chat')}</span></span>
+                  </div>
+                  <div class="stcap-list">
+                    <label class="stcap-item">
+                      <input type="checkbox" id="stcap-inc-live-preset" checked />
+                      <span class="stcap-item-label">当前实时生效预设参数 (含卡绑定预设)</span>
+                    </label>
+                    ${presetItemsHtml}
+                  </div>
+                </div>
+
+                <div class="stcap-section">
+                  <div class="stcap-section-head">
+                    <span class="stcap-section-title">🧬 正则 · 酒馆助手 · 人设</span>
+                  </div>
+                  <div class="stcap-list">
+                    <label class="stcap-item">
+                      <input type="checkbox" id="stcap-inc-global-regex" checked />
+                      <span class="stcap-item-label">全局正则脚本 (Global Regex)</span>
+                      <span class="stcap-badge">${inspected.globalRegex.length} 条</span>
+                    </label>
+                    <label class="stcap-item">
+                      <input type="checkbox" id="stcap-inc-scoped-regex" checked />
+                      <span class="stcap-item-label">角色局部正则 (Character Regex)</span>
+                      <span class="stcap-badge">${inspected.scopedRegex.length} 条</span>
+                    </label>
+                    <label class="stcap-item">
+                      <input type="checkbox" id="stcap-inc-preset-regex" checked />
+                      <span class="stcap-item-label">预设绑定正则 (Preset Regex)</span>
+                      <span class="stcap-badge">${inspected.presetRegex.length} 条</span>
+                    </label>
+                    <label class="stcap-item">
+                      <input type="checkbox" id="stcap-inc-th-scripts" checked />
+                      <span class="stcap-item-label">酒馆助手脚本 (TavernHelper)</span>
+                      <span class="stcap-badge">全局 ${inspected.thGlobalScripts.length} · 角色 ${inspected.thCharScripts.length}</span>
+                    </label>
+                    <label class="stcap-item">
+                      <input type="checkbox" id="stcap-inc-persona" checked />
+                      <span class="stcap-item-label">当前用户名与人设描述 ({{user}})</span>
+                      <span class="stcap-item-sub">${escapeHtml(ctx.name1 || '')}</span>
+                    </label>
+                  </div>
+                </div>
+              </div>
             `;
-        }).join('');
 
-        const chatItemsHtml = inspected.chatFiles.length > 0
-            ? inspected.chatFiles.map(cf => `
-              <label class="stcap-item">
-                <input type="checkbox" class="stcap-chat-chk" value="${escapeHtml(cf.file_id)}" checked />
-                <span class="stcap-item-label" title="${escapeHtml(cf.file_id)}">${escapeHtml(cf.file_id)}</span>
-                <span class="stcap-item-sub">${cf.is_active ? '★当前 · ' : ''}${cf.message_count} 条 ${cf.file_size ? `· ${escapeHtml(cf.file_size)}` : ''}</span>
-              </label>
-            `).join('')
-            : `<div style="color:#64748b;font-size:12px;padding:8px;">该角色暂无历史聊天记录 (.jsonl)</div>`;
-
-        bodyEl.innerHTML = `
-          <div class="stcap-char-bar">
-            <img class="stcap-avatar-preview" src="/characters/${encodeURIComponent(inspected.avatar)}" onerror="this.style.display='none'" />
-            <div style="flex:1;min-width:220px;">
-              <div style="font-size:12px;color:#94a3b8;margin-bottom:4px;">选择要打包的角色卡（已自动勾选其绑定的世界书、激活预设、正则与全部聊天记录）</div>
-              <select class="stcap-select" id="stcap-char-select">${charOptionsHtml}</select>
-            </div>
-          </div>
-
-          <div class="stcap-grid">
-            <div class="stcap-section">
-              <div class="stcap-section-head">
-                <span class="stcap-section-title">🌍 多本世界书 <span class="stcap-badge">${inspected.worldbookOptions.filter(w => w.preselected).length} 已绑定 / 共 ${inspected.worldbookOptions.length}</span></span>
-                <div class="stcap-mini-actions">
-                  <button class="stcap-mini-btn" id="stcap-wb-bound">仅绑定</button>
-                  <button class="stcap-mini-btn" id="stcap-wb-all">全选</button>
-                  <button class="stcap-mini-btn" id="stcap-wb-none">清空</button>
-                </div>
+            const showMobileShare = canShareFileMobile();
+            footerEl.innerHTML = `
+              <div class="stcap-status" id="stcap-status">
+                ${isLukerAndroidApp()
+                    ? '已识别 Luker 安卓客户端：点击下方导出将直接唤起安卓系统原生文件保存框。'
+                    : '就绪：单卡 PNG 模式会将所有数据 GZIP 高压缩写入 PNG 的 st_capsule 块。'}
               </div>
-              <input type="text" class="stcap-search" id="stcap-wb-search" placeholder="搜索世界书名称（可勾选任意多本一起打包）..." />
-              <div class="stcap-list" id="stcap-wb-list">${wbItemsHtml}</div>
-            </div>
-
-            <div class="stcap-section">
-              <div class="stcap-section-head">
-                <span class="stcap-section-title">💬 所有聊天记录 <span class="stcap-badge">${inspected.chatFiles.length} 个分支</span></span>
-                <div class="stcap-mini-actions">
-                  <button class="stcap-mini-btn" id="stcap-chat-all">全选</button>
-                  <button class="stcap-mini-btn" id="stcap-chat-none">清空</button>
-                </div>
+              <div class="stcap-export-btns">
+                <button type="button" class="stcap-action-btn secondary" id="stcap-btn-json">📄 导出独立文件 (.stcapsule.json)</button>
+                <button type="button" class="stcap-action-btn" id="stcap-btn-png">🖼️ 绑定在一张卡里导出 (.capsule.png)</button>
+                ${showMobileShare ? `<button type="button" class="stcap-action-btn" id="stcap-btn-share" style="background:linear-gradient(135deg,#059669,#0284c7);">📲 系统转发分享 (.capsule.png)</button>` : ''}
               </div>
-              <div class="stcap-list">${chatItemsHtml}</div>
-            </div>
+            `;
 
-            <div class="stcap-section">
-              <div class="stcap-section-head">
-                <span class="stcap-section-title">🎛️ 预设 (Presets) <span class="stcap-badge">${escapeHtml(ctx.mainApi || 'Chat')}</span></span>
-              </div>
-              <div class="stcap-list">${presetItemsHtml || '<div style="color:#64748b;font-size:12px;padding:6px;">未检测到预设列表，将直接抓取当前运行参数</div>'}</div>
-            </div>
-
-            <div class="stcap-section">
-              <div class="stcap-section-head">
-                <span class="stcap-section-title">🧬 正则 · 酒馆助手 · 人设</span>
-              </div>
-              <div class="stcap-list">
-                <label class="stcap-item">
-                  <input type="checkbox" id="stcap-inc-global-regex" checked />
-                  <span class="stcap-item-label">全局正则脚本 (Global Regex)</span>
-                  <span class="stcap-badge">${inspected.globalRegex.length} 条</span>
-                </label>
-                <label class="stcap-item">
-                  <input type="checkbox" id="stcap-inc-scoped-regex" checked />
-                  <span class="stcap-item-label">角色局部正则 (Character Regex)</span>
-                  <span class="stcap-badge">${inspected.scopedRegex.length} 条</span>
-                </label>
-                <label class="stcap-item">
-                  <input type="checkbox" id="stcap-inc-preset-regex" checked />
-                  <span class="stcap-item-label">预设绑定正则 (Preset Regex)</span>
-                  <span class="stcap-badge">${inspected.presetRegex.length} 条</span>
-                </label>
-                <label class="stcap-item">
-                  <input type="checkbox" id="stcap-inc-th-scripts" checked />
-                  <span class="stcap-item-label">酒馆助手脚本 (TavernHelper)</span>
-                  <span class="stcap-badge">全局 ${inspected.thGlobalScripts.length} · 角色 ${inspected.thCharScripts.length}</span>
-                </label>
-                <label class="stcap-item">
-                  <input type="checkbox" id="stcap-inc-persona" checked />
-                  <span class="stcap-item-label">当前用户名与人设描述 ({{user}} Persona)</span>
-                  <span class="stcap-item-sub">${escapeHtml(ctx.name1 || '')}</span>
-                </label>
-              </div>
-            </div>
-          </div>
-        `;
-
-        const showMobileShare = canShareFileMobile();
-        footerEl.innerHTML = `
-          <div class="stcap-status" id="stcap-status">就绪：单卡 PNG 模式会将所有数据 GZIP 高压缩写入 PNG 的 <code>st_capsule</code> 块，同时完整保留标准 V2/V3 角色卡。</div>
-          <div class="stcap-export-btns">
-            <button class="stcap-action-btn secondary" id="stcap-btn-json">📄 导出独立文件 (.stcapsule.json)</button>
-            <button class="stcap-action-btn" id="stcap-btn-png">🖼️ 绑定在一张卡里导出 (.capsule.png)</button>
-            ${showMobileShare ? `<button class="stcap-action-btn" id="stcap-btn-share" style="background:linear-gradient(135deg,#059669,#0284c7);">📲 手机端直接转发 (.capsule.png)</button>` : ''}
-          </div>
-        `;
-
-        bodyEl.querySelector('#stcap-char-select').addEventListener('change', async (e) => {
-            currentChid = Number(e.target.value);
-            await renderExportTab();
-        });
-
-        bodyEl.querySelector('#stcap-wb-search').addEventListener('input', (e) => {
-            const q = e.target.value.trim().toLowerCase();
-            bodyEl.querySelectorAll('.stcap-wb-row').forEach(row => {
-                row.style.display = !q || row.dataset.name.includes(q) ? '' : 'none';
+            bodyEl.querySelector('#stcap-char-select').addEventListener('change', async (e) => {
+                currentChid = Number(e.target.value);
+                await renderExportTab();
             });
-        });
 
-        bodyEl.querySelector('#stcap-wb-all').addEventListener('click', () => {
-            bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { if (c.closest('.stcap-wb-row').style.display !== 'none') c.checked = true; });
-        });
-        bodyEl.querySelector('#stcap-wb-none').addEventListener('click', () => {
-            bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { c.checked = false; });
-        });
-        bodyEl.querySelector('#stcap-wb-bound').addEventListener('click', () => {
-            const boundSet = new Set(inspected.worldbookOptions.filter(w => w.preselected).map(w => w.name));
-            bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { c.checked = boundSet.has(c.value); });
-        });
+            bodyEl.querySelector('#stcap-wb-search').addEventListener('input', (e) => {
+                const q = e.target.value.trim().toLowerCase();
+                bodyEl.querySelectorAll('.stcap-wb-row').forEach(row => {
+                    row.style.display = !q || row.dataset.name.includes(q) ? '' : 'none';
+                });
+            });
 
-        bodyEl.querySelector('#stcap-chat-all').addEventListener('click', () => {
-            bodyEl.querySelectorAll('.stcap-chat-chk').forEach(c => { c.checked = true; });
-        });
-        bodyEl.querySelector('#stcap-chat-none').addEventListener('click', () => {
-            bodyEl.querySelectorAll('.stcap-chat-chk').forEach(c => { c.checked = false; });
-        });
+            bodyEl.querySelector('#stcap-wb-all').addEventListener('click', () => {
+                bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { if (c.closest('.stcap-wb-row').style.display !== 'none') c.checked = true; });
+            });
+            bodyEl.querySelector('#stcap-wb-none').addEventListener('click', () => {
+                bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { c.checked = false; });
+            });
+            bodyEl.querySelector('#stcap-wb-bound').addEventListener('click', () => {
+                const boundSet = new Set(inspected.worldbookOptions.filter(w => w.preselected).map(w => w.name));
+                bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { c.checked = boundSet.has(c.value); });
+            });
 
-        footerEl.querySelector('#stcap-btn-png').addEventListener('click', () => runExport('png', false));
-        footerEl.querySelector('#stcap-btn-json').addEventListener('click', () => runExport('json', false));
-        footerEl.querySelector('#stcap-btn-share')?.addEventListener('click', () => runExport('png', true));
+            bodyEl.querySelector('#stcap-chat-all').addEventListener('click', () => {
+                bodyEl.querySelectorAll('.stcap-chat-chk').forEach(c => { c.checked = true; });
+            });
+            bodyEl.querySelector('#stcap-chat-none').addEventListener('click', () => {
+                bodyEl.querySelectorAll('.stcap-chat-chk').forEach(c => { c.checked = false; });
+            });
+
+            footerEl.querySelector('#stcap-btn-png').addEventListener('click', () => runExport('png', false));
+            footerEl.querySelector('#stcap-btn-json').addEventListener('click', () => runExport('json', false));
+            footerEl.querySelector('#stcap-btn-share')?.addEventListener('click', () => runExport('png', true));
+        } catch (err) {
+            console.error('[ST-Capsule] renderExportTab error:', err);
+            bodyEl.innerHTML = `<div style="padding:20px;color:#fca5a5;background:rgba(127,29,29,0.25);border-radius:8px;">加载角色打包面板出错：${escapeHtml(err?.message || String(err))}</div>`;
+        }
     }
 
     async function runExport(mode, useMobileShare = false) {
@@ -794,9 +955,15 @@ async function openCapsuleModal(initialTab = 'export') {
         if (btnShare) btnShare.disabled = true;
 
         try {
+            const { pmMod, puMod, wiMod, openaiMod } = await getHostMods();
+            const power_user = puMod.power_user || ctx.powerUserSettings || {};
+            const world_info = wiMod.world_info || {};
+            const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
+
             const selectedWbs = [...bodyEl.querySelectorAll('.stcap-wb-chk:checked')].map(c => c.value);
             const selectedChats = [...bodyEl.querySelectorAll('.stcap-chat-chk:checked')].map(c => c.value);
             const selectedPresets = [...bodyEl.querySelectorAll('.stcap-preset-chk:checked')].map(c => c.value);
+            const incLivePreset = bodyEl.querySelector('#stcap-inc-live-preset')?.checked;
 
             const incGlobalRegex = bodyEl.querySelector('#stcap-inc-global-regex')?.checked;
             const incScopedRegex = bodyEl.querySelector('#stcap-inc-scoped-regex')?.checked;
@@ -808,26 +975,27 @@ async function openCapsuleModal(initialTab = 'export') {
             const pngBytes = await fetchCharacterAvatarBytes(inspected.avatar);
             const v2Card = buildStandardV2Card(inspected.charObj);
 
-            // Fetch selected worldbooks
+            // 1. Fetch selected worldbooks
             const booksOut = [];
             for (let i = 0; i < selectedWbs.length; i++) {
                 const wbName = selectedWbs[i];
                 statusEl.textContent = `正在打包世界书 (${i + 1}/${selectedWbs.length}): ${wbName}...`;
                 try {
                     const wbData = await apiPost('/api/worldinfo/get', { name: wbName });
-                    const opt = inspected.worldbookOptions.find(o => o.name === wbName);
-                    booksOut.push({
-                        name: wbName,
-                        roles: opt?.roles || [],
-                        entry_count: Object.keys(wbData?.entries || {}).length,
-                        data: wbData,
-                    });
+                    if (wbData && typeof wbData === 'object') {
+                        const opt = inspected.worldbookOptions.find(o => o.name === wbName);
+                        booksOut.push({
+                            name: wbName,
+                            roles: opt?.roles || [],
+                            entry_count: Object.keys(wbData?.entries || {}).length,
+                            data: wbData,
+                        });
+                    }
                 } catch (err) {
                     console.warn('[ST-Capsule] Failed reading worldbook:', wbName, err);
                 }
             }
 
-            // Also attach primary worldbook into v2Card.data.character_book if present so standard card readers see it
             const primaryBookName = v2Card.data?.extensions?.world;
             const primaryFound = booksOut.find(b => b.name === primaryBookName);
             if (primaryFound?.data?.entries && !v2Card.data.character_book) {
@@ -847,37 +1015,53 @@ async function openCapsuleModal(initialTab = 'export') {
                 v2Card.data.character_book = { name: primaryBookName, entries: entriesArr };
             }
 
-            // Fetch presets
-            statusEl.textContent = `正在提取预设配置 (${selectedPresets.length} 个)...`;
-            const pm = getPresetManager?.();
+            // 2. Fetch presets (including Luker live / card-bound preset fallback)
+            statusEl.textContent = `正在提取预设配置...`;
+            const pm = typeof getPresetManager === 'function' ? getPresetManager() : null;
             const presetItems = [];
+            const seenPresetNames = new Set();
+
             for (const pName of selectedPresets) {
                 try {
-                    const pData = pm?.getPresetSettings?.(pName);
+                    const pData = pm?.getPresetSettings?.(pName) || pm?.getCompletionPresetByName?.(pName);
                     if (pData) {
                         presetItems.push({
                             name: pName,
                             is_active: pName === inspected.activePresetName,
-                            data: structuredClone(pData),
+                            data: safeJsonClone(pData, {}),
                         });
+                        seenPresetNames.add(pName);
                     }
                 } catch (e) {
                     console.warn('[ST-Capsule] Preset fetch warning:', pName, e);
                 }
             }
 
-            // Fetch all selected chat histories (.jsonl arrays)
+            if (incLivePreset && openaiMod?.oai_settings && (!inspected.activePresetName || !seenPresetNames.has(inspected.activePresetName))) {
+                const liveName = inspected.activePresetName || '当前实时运行预设';
+                presetItems.unshift({
+                    name: liveName,
+                    is_active: true,
+                    data: safeJsonClone(openaiMod.oai_settings, {}),
+                });
+            }
+
+            // 3. Fetch all selected chat histories
             const chatsOut = [];
             for (let i = 0; i < selectedChats.length; i++) {
                 const chatId = selectedChats[i];
                 statusEl.textContent = `正在提取聊天记录 (${i + 1}/${selectedChats.length}): ${chatId}...`;
                 try {
-                    const messages = await apiPost('/api/chats/get', {
+                    const rawResp = await apiPost('/api/chats/get', {
                         ch_name: inspected.name,
                         file_name: chatId,
                         avatar_url: inspected.avatar,
                     });
-                    if (Array.isArray(messages)) {
+                    let messages = normalizeChatMessagesResponse(rawResp);
+                    if (!messages && chatId === inspected.charObj.chat && Array.isArray(ctx.chat) && ctx.chat.length > 0) {
+                        messages = [{ user_name: ctx.name1, character_name: inspected.name, chat_metadata: safeJsonClone(ctx.chatMetadata, {}) }, ...safeJsonClone(ctx.chat, [])];
+                    }
+                    if (Array.isArray(messages) && messages.length > 0) {
                         const metaObj = messages[0]?.chat_metadata ? messages[0] : { chat_metadata: {} };
                         const msgCount = messages.filter(m => !m.chat_metadata || m.mes !== undefined).length;
                         chatsOut.push({
@@ -894,7 +1078,23 @@ async function openCapsuleModal(initialTab = 'export') {
                 }
             }
 
-            // Persona snapshot
+            // If character has unsaved in-memory chat messages and no .jsonl file yet, include current memory chat
+            if (chatsOut.length === 0 && ctx.characterId == inspected.chid && Array.isArray(ctx.chat) && ctx.chat.length > 0) {
+                const memMsgs = [
+                    { user_name: ctx.name1 || 'User', character_name: inspected.name, chat_metadata: safeJsonClone(ctx.chatMetadata, {}) },
+                    ...safeJsonClone(ctx.chat, []),
+                ];
+                chatsOut.push({
+                    file_id: `${inspected.name}_current`,
+                    file_name: `${inspected.name}_current.jsonl`,
+                    is_active_chat: true,
+                    message_count: ctx.chat.length,
+                    chat_metadata: safeJsonClone(ctx.chatMetadata, {}),
+                    messages: memMsgs,
+                });
+            }
+
+            // 4. Persona snapshot
             let personaOut = null;
             if (incPersona) {
                 const userAvatar = power_user?.personas
@@ -909,11 +1109,15 @@ async function openCapsuleModal(initialTab = 'export') {
                 };
             }
 
+            const auxExtraBooks = inspected.worldbookOptions
+                .filter(w => w.roles.includes('角色附加世界书'))
+                .map(w => w.name);
+
             const capsuleObj = {
                 spec: 'st_capsule_v1',
-                version: '1.0.0',
+                version: '1.2.0',
                 exported_at: new Date().toISOString(),
-                source: 'SillyTavern-ST-Capsule-Packer',
+                source: isLukerAndroidApp() ? 'Luker-Android-ST-Capsule-Packer' : 'SillyTavern-ST-Capsule-Packer',
                 character: {
                     name: inspected.name,
                     avatar: inspected.avatar,
@@ -924,27 +1128,27 @@ async function openCapsuleModal(initialTab = 'export') {
                 presets: {
                     active_preset_name: inspected.activePresetName,
                     items: presetItems,
-                    power_user_context: {
+                    power_user_context: safeJsonClone({
                         instruct: power_user?.instruct || null,
                         context: power_user?.context || null,
                         sysprompt: power_user?.sysprompt || null,
                         reasoning: power_user?.reasoning || null,
-                    },
+                    }, {}),
                 },
                 regex: {
-                    global: incGlobalRegex ? structuredClone(inspected.globalRegex) : [],
-                    scoped: incScopedRegex ? structuredClone(inspected.scopedRegex) : [],
-                    preset: incPresetRegex ? structuredClone(inspected.presetRegex) : [],
+                    global: incGlobalRegex ? safeJsonClone(inspected.globalRegex, []) : [],
+                    scoped: incScopedRegex ? safeJsonClone(inspected.scopedRegex, []) : [],
+                    preset: incPresetRegex ? safeJsonClone(inspected.presetRegex, []) : [],
                 },
                 tavern_helper: {
-                    global_scripts: incThScripts ? structuredClone(inspected.thGlobalScripts) : [],
-                    character_scripts: incThScripts ? structuredClone(inspected.thCharScripts) : [],
+                    global_scripts: incThScripts ? safeJsonClone(inspected.thGlobalScripts, []) : [],
+                    character_scripts: incThScripts ? safeJsonClone(inspected.thCharScripts, []) : [],
                 },
                 worldbooks: {
                     bindings: {
                         primary: v2Card.data?.extensions?.world || null,
-                        extra: (world_info?.charLore?.find(e => e.name === inspected.charKey || e.name === inspected.avatar)?.extraBooks) || [],
-                        global: world_info?.globalSelect || [],
+                        extra: auxExtraBooks,
+                        global: safeJsonClone(world_info?.globalSelect || [], []),
                     },
                     books: booksOut,
                 },
@@ -958,22 +1162,37 @@ async function openCapsuleModal(initialTab = 'export') {
                 statusEl.textContent = `正在进行 GZIP 压缩并写入角色卡 PNG 数据块...`;
                 const compressedChunkText = await compressCapsulePayload(jsonStr);
                 const finalPngBytes = buildCapsulePng(pngBytes, v2Card, compressedChunkText);
-                const blob = new Blob([finalPngBytes], { type: 'image/png' });
-                await triggerBlobDownload(blob, `${safeBase}.capsule.png`, useMobileShare);
+                const fileName = `${safeBase}.capsule.png`;
+                const saved = await saveGeneratedPayload({
+                    bytes: finalPngBytes,
+                    filename: fileName,
+                    mimeType: 'image/png',
+                    useMobileShare,
+                });
                 const mb = (finalPngBytes.byteLength / 1024 / 1024).toFixed(2);
-                statusEl.textContent = `✅ 已导出单卡合一 PNG：${safeBase}.capsule.png (${mb} MB，含 ${booksOut.length} 本世界书、${chatsOut.length} 段聊天、${presetItems.length} 套预设)`;
-                if (window.toastr) window.toastr.success(`已导出 ${safeBase}.capsule.png (${mb} MB)`);
+                statusEl.textContent = saved.via === 'luker-android-saf'
+                    ? `✅ 已唤起安卓系统保存框：${fileName} (${mb} MB，请选择保存目录)`
+                    : `✅ 已导出单卡合一 PNG：${fileName} (${mb} MB，含 ${booksOut.length} 本世界书、${chatsOut.length} 段聊天)`;
+                if (window.toastr) window.toastr.success(`已生成 ${fileName} (${mb} MB)`);
             } else {
-                const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
-                await triggerBlobDownload(blob, `${safeBase}.stcapsule.json`, useMobileShare);
-                const mb = (blob.size / 1024 / 1024).toFixed(2);
-                statusEl.textContent = `✅ 已导出独立全量包：${safeBase}.stcapsule.json (${mb} MB)`;
-                if (window.toastr) window.toastr.success(`已导出 ${safeBase}.stcapsule.json (${mb} MB)`);
+                const jsonBytes = new TextEncoder().encode(jsonStr);
+                const fileName = `${safeBase}.stcapsule.json`;
+                const saved = await saveGeneratedPayload({
+                    bytes: jsonBytes,
+                    filename: fileName,
+                    mimeType: 'application/json',
+                    useMobileShare,
+                });
+                const mb = (jsonBytes.byteLength / 1024 / 1024).toFixed(2);
+                statusEl.textContent = saved.via === 'luker-android-saf'
+                    ? `✅ 已唤起安卓系统保存框：${fileName} (${mb} MB，请选择保存目录)`
+                    : `✅ 已导出独立全量包：${fileName} (${mb} MB)`;
+                if (window.toastr) window.toastr.success(`已生成 ${fileName} (${mb} MB)`);
             }
         } catch (err) {
             console.error('[ST-Capsule] Export error:', err);
-            statusEl.textContent = `❌ 导出失败：${err.message || err}`;
-            if (window.toastr) window.toastr.error(String(err.message || err));
+            statusEl.textContent = `❌ 导出失败：${err?.message || err}`;
+            if (window.toastr) window.toastr.error(String(err?.message || err));
         } finally {
             btnPng.disabled = false;
             btnJson.disabled = false;
@@ -982,20 +1201,19 @@ async function openCapsuleModal(initialTab = 'export') {
     }
 
     function renderImportTab() {
-        loadedImport = null;
         bodyEl.innerHTML = `
           <div class="stcap-dropzone" id="stcap-dropzone">
             <div style="font-size:28px;margin-bottom:8px;">📥</div>
             <div style="font-size:14px;font-weight:700;color:#e2e8f0;">点击选择或拖入 <code>.capsule.png</code> / <code>.stcapsule.json</code> / 普通角色卡 <code>.png</code></div>
             <div style="font-size:12px;color:#94a3b8;margin-top:6px;">支持完整解析并按需勾选还原：角色卡本体、多本世界书及绑定关系、预设、全局/局部正则、全部历史聊天分支</div>
-            <input type="file" id="stcap-file-input" accept=".png,.json" style="display:none" />
+            <input type="file" id="stcap-file-input" accept=".png,.json,image/png,application/json" style="display:none" />
           </div>
           <div id="stcap-import-preview"></div>
         `;
         footerEl.innerHTML = `
           <div class="stcap-status" id="stcap-import-status">等待载入胶囊文件...</div>
           <div class="stcap-export-btns">
-            <button class="stcap-action-btn" id="stcap-btn-restore" disabled>⚡ 一键还原勾选项到酒馆</button>
+            <button type="button" class="stcap-action-btn" id="stcap-btn-restore" disabled>⚡ 一键还原勾选项到酒馆</button>
           </div>
         `;
 
@@ -1021,8 +1239,7 @@ async function openCapsuleModal(initialTab = 'export') {
         try {
             statusEl.textContent = `正在解析 ${file.name}...`;
             const parsed = await parseAnyCapsuleOrCardFile(file);
-            loadedImport = parsed.capsule;
-            const cap = loadedImport;
+            const cap = parsed.capsule;
             const books = cap.worldbooks?.books || [];
             const chats = cap.chats || [];
             const presets = cap.presets?.items || [];
@@ -1089,7 +1306,7 @@ async function openCapsuleModal(initialTab = 'export') {
         } catch (err) {
             console.error('[ST-Capsule] Import parse error:', err);
             previewEl.innerHTML = '';
-            statusEl.textContent = `❌ 解析失败：${err.message || err}`;
+            statusEl.textContent = `❌ 解析失败：${err?.message || err}`;
             restoreBtn.disabled = true;
         }
     }
@@ -1099,7 +1316,11 @@ async function openCapsuleModal(initialTab = 'export') {
         const restoreBtn = footerEl.querySelector('#stcap-btn-restore');
         restoreBtn.disabled = true;
         try {
-            // 1. Restore Worldbooks first so bindings work
+            const { extMod, pmMod, wiMod } = await getHostMods();
+            const extension_settings = extMod.extension_settings || ctx.extensionSettings || {};
+            const world_info = wiMod.world_info || {};
+            const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
+
             const wbIndices = [...bodyEl.querySelectorAll('.stcap-res-wb:checked')].map(c => Number(c.value));
             for (const idx of wbIndices) {
                 const wb = cap.worldbooks.books[idx];
@@ -1108,8 +1329,7 @@ async function openCapsuleModal(initialTab = 'export') {
                 await apiPost('/api/worldinfo/edit', { name: wb.name, data: wb.data });
             }
 
-            // 2. Restore Character Card if checked
-            let targetAvatar = cap.character?.avatar || `${ sanitizeDownloadName(cap.character?.name || 'Character') }.png`;
+            let targetAvatar = cap.character?.avatar || `${sanitizeDownloadName(cap.character?.name || 'Character')}.png`;
             if (bodyEl.querySelector('#stcap-res-char')?.checked && cap.character?.card) {
                 statusEl.textContent = `正在导入角色卡：${cap.character.name}...`;
                 let pngBytes = cap._raw_png_bytes;
@@ -1119,7 +1339,6 @@ async function openCapsuleModal(initialTab = 'export') {
                 if (!pngBytes) {
                     pngBytes = await createFallbackPngBytes(cap.character.name);
                 }
-                // Write clean standard V2/V3 card PNG for SillyTavern character import
                 const cleanChunks = extractPngChunks(pngBytes).filter(ch => {
                     if (ch.name !== 'tEXt') return true;
                     const dec = decodeTextChunk(ch.data);
@@ -1142,23 +1361,26 @@ async function openCapsuleModal(initialTab = 'export') {
                 }
             }
 
-            // Restore extraBooks world_info.charLore binding
             const extraBooks = cap.worldbooks?.bindings?.extra || [];
-            if (extraBooks.length > 0 && world_info) {
+            if (extraBooks.length > 0) {
                 const charKey = targetAvatar.replace(/\.png$/i, '');
-                world_info.charLore = world_info.charLore || [];
-                const existing = world_info.charLore.find(e => e.name === charKey);
-                if (existing) {
-                    existing.extraBooks = [...new Set([...(existing.extraBooks || []), ...extraBooks])];
-                } else {
-                    world_info.charLore.push({ name: charKey, extraBooks: [...extraBooks] });
+                if (typeof wiMod.charSetAuxWorlds === 'function') {
+                    try { wiMod.charSetAuxWorlds(targetAvatar, extraBooks); } catch {}
                 }
-                ctx.saveSettingsDebounced?.();
+                if (world_info) {
+                    world_info.charLore = world_info.charLore || [];
+                    const existing = world_info.charLore.find(e => e.name === charKey);
+                    if (existing) {
+                        existing.extraBooks = [...new Set([...(existing.extraBooks || []), ...extraBooks])];
+                    } else {
+                        world_info.charLore.push({ name: charKey, extraBooks: [...extraBooks] });
+                    }
+                    ctx.saveSettingsDebounced?.();
+                }
             }
 
-            // 3. Restore Presets
             const presetIndices = [...bodyEl.querySelectorAll('.stcap-res-preset:checked')].map(c => Number(c.value));
-            const pm = getPresetManager?.();
+            const pm = typeof getPresetManager === 'function' ? getPresetManager() : null;
             for (const idx of presetIndices) {
                 const p = cap.presets.items[idx];
                 if (p?.name && p?.data && pm?.savePreset) {
@@ -1167,7 +1389,6 @@ async function openCapsuleModal(initialTab = 'export') {
                 }
             }
 
-            // 4. Restore Global Regex (dedup by id)
             if (bodyEl.querySelector('#stcap-res-gregex')?.checked && Array.isArray(cap.regex?.global)) {
                 extension_settings.regex = extension_settings.regex || [];
                 const existingIds = new Set(extension_settings.regex.map(r => r.id));
@@ -1179,7 +1400,6 @@ async function openCapsuleModal(initialTab = 'export') {
                 ctx.saveSettingsDebounced?.();
             }
 
-            // 5. Restore Chat Histories
             const chatIndices = [...bodyEl.querySelectorAll('.stcap-res-chat:checked')].map(c => Number(c.value));
             for (const idx of chatIndices) {
                 const ch = cap.chats[idx];
@@ -1195,12 +1415,12 @@ async function openCapsuleModal(initialTab = 'export') {
             }
 
             if (typeof ctx.getCharacters === 'function') await ctx.getCharacters();
-            statusEl.textContent = `✅ 还原完成！已写入 ${wbIndices.length} 本世界书、${presetIndices.length} 套预设、${chatIndices.length} 段聊天记录。`;
+            statusEl.textContent = `✅ 还原完成：已写入 ${wbIndices.length} 本世界书、${presetIndices.length} 套预设、${chatIndices.length} 段聊天记录。`;
             if (window.toastr) window.toastr.success('全量胶囊还原成功');
         } catch (err) {
             console.error('[ST-Capsule] Restore error:', err);
-            statusEl.textContent = `❌ 还原出错：${err.message || err}`;
-            if (window.toastr) window.toastr.error(String(err.message || err));
+            statusEl.textContent = `❌ 还原出错：${err?.message || err}`;
+            if (window.toastr) window.toastr.error(String(err?.message || err));
         } finally {
             restoreBtn.disabled = false;
         }
@@ -1211,56 +1431,99 @@ async function openCapsuleModal(initialTab = 'export') {
 }
 
 // ============================================================================
-// Extension Mounting (Drawer + Wand Menu + Character Panel + Slash Command)
+// Resilient Mounting & Document-Level Event Delegation (Luker & ST Safe)
 // ============================================================================
-jQuery(async () => {
-    // 1. Settings Drawer Panel
-    const settingsHtml = `
-      <div class="extension_container" id="st_capsule_packer_container">
-        <div class="inline-drawer">
-          <div class="inline-drawer-toggle inline-drawer-header">
-            <b>📦 酒馆全量胶囊打包器 (ST Capsule Packer)</b>
-            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-          </div>
-          <div class="inline-drawer-content stcap-drawer-box">
-            <div style="color:#94a3b8;line-height:1.5;">
-              将角色卡、当前预设、全局/局部正则、酒馆助手脚本、绑定的多本世界书与所有历史聊天记录一键压入单张 <code>.capsule.png</code> 角色卡或独立 <code>.stcapsule.json</code> 备份文件，可直接拖入 Antigravity 检视台或随时还原。
-            </div>
-            <div class="stcap-btn-row">
-              <button class="stcap-trigger-btn primary" id="stcap-open-export">📤 打包导出当前角色</button>
-              <button class="stcap-trigger-btn" id="stcap-open-import">📥 读取 / 还原胶囊</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    `;
-    $('#extensions_settings2').append(settingsHtml);
-    $('#stcap-open-export').on('click', () => openCapsuleModal('export'));
-    $('#stcap-open-import').on('click', () => openCapsuleModal('import'));
+function mountExtensionUi() {
+    ensureCriticalStyles();
 
-    // 2. Bottom-Left Wand / Extensions Menu (#extensionsMenu) — Mobile & Luker UI friendly!
-    if ($('#extensionsMenu').length && !$('#stcap-wand-item').length) {
-        const wandItem = $(`
-          <div id="stcap-wand-item" class="list-group-item flex-container flexGap5 interactable" tabindex="0">
-            <div class="fa-solid fa-box-archive extensionsMenuExtensionButton"></div>
-            <span>全量角色胶囊打包 / 还原</span>
+    const drawerTarget = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
+    if (drawerTarget && !document.getElementById('st_capsule_packer_container')) {
+        const wrap = document.createElement('div');
+        wrap.className = 'extension_container';
+        wrap.id = 'st_capsule_packer_container';
+        wrap.innerHTML = `
+          <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+              <b>📦 酒馆全量胶囊打包器 (ST Capsule Packer)</b>
+              <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content stcap-drawer-box">
+              <div style="color:#94a3b8;line-height:1.5;">
+                将角色卡、当前预设、全局/局部正则、酒馆助手脚本、绑定的多本世界书与所有历史聊天记录一键压入单张 <code>.capsule.png</code> 角色卡或独立 <code>.stcapsule.json</code> 备份文件。
+              </div>
+              <div class="stcap-btn-row">
+                <button type="button" class="stcap-trigger-btn primary" id="stcap-open-export">📤 打包导出当前角色</button>
+                <button type="button" class="stcap-trigger-btn" id="stcap-open-import">📥 读取 / 还原胶囊</button>
+              </div>
+            </div>
           </div>
-        `);
-        wandItem.on('click', () => {
-            $('#extensionsMenu').hide();
+        `;
+        drawerTarget.appendChild(wrap);
+    }
+
+    const wandMenu = document.getElementById('extensionsMenu');
+    if (wandMenu && !document.getElementById('stcap-wand-item')) {
+        const wandItem = document.createElement('div');
+        wandItem.id = 'stcap-wand-item';
+        wandItem.className = 'list-group-item flex-container flexGap5 interactable';
+        wandItem.tabIndex = 0;
+        wandItem.innerHTML = `
+          <div class="fa-solid fa-box-archive extensionsMenuExtensionButton"></div>
+          <span>全量角色胶囊打包 / 还原</span>
+        `;
+        wandMenu.appendChild(wandItem);
+    }
+
+    const exportBtn = document.getElementById('export_button');
+    if (exportBtn && !document.getElementById('stcap-char-btn')) {
+        const charBtn = document.createElement('div');
+        charBtn.id = 'stcap-char-btn';
+        charBtn.className = 'menu_button fa-solid fa-box-archive interactable';
+        charBtn.title = '打包全量角色胶囊 (含预设/正则/多世界书/全部聊天)';
+        charBtn.tabIndex = 0;
+        exportBtn.insertAdjacentElement('afterend', charBtn);
+    }
+}
+
+// Global delegated click listener (survives DOM clones, drawer moves, and prevents drawer auto-close)
+if (!window.__stCapsuleDelegatedBound) {
+    window.__stCapsuleDelegatedBound = true;
+    document.addEventListener('click', (e) => {
+        const target = e.target instanceof Element ? e.target : null;
+        if (!target) return;
+
+        const exportTrigger = target.closest('#stcap-open-export, #stcap-char-btn');
+        if (exportTrigger) {
+            e.preventDefault();
+            e.stopPropagation();
             openCapsuleModal('export');
-        });
-        $('#extensionsMenu').append(wandItem);
-    }
+            return;
+        }
 
-    // 3. Character Right Panel Quick Button (next to export_button)
-    if ($('#export_button').length && !$('#stcap-char-btn').length) {
-        const charBtn = $(`<div id="stcap-char-btn" class="menu_button fa-solid fa-box-archive interactable" title="打包全量角色胶囊 (含预设/正则/多世界书/全部聊天)" tabindex="0"></div>`);
-        charBtn.on('click', () => openCapsuleModal('export'));
-        $('#export_button').after(charBtn);
-    }
+        const importTrigger = target.closest('#stcap-open-import');
+        if (importTrigger) {
+            e.preventDefault();
+            e.stopPropagation();
+            openCapsuleModal('import');
+            return;
+        }
 
-    // 4. Slash Command /capsule
+        const wandTrigger = target.closest('#stcap-wand-item');
+        if (wandTrigger) {
+            e.preventDefault();
+            e.stopPropagation();
+            const wm = document.getElementById('extensionsMenu');
+            if (wm) wm.style.display = 'none';
+            openCapsuleModal('export');
+        }
+    }, true);
+}
+
+function initExtension() {
+    mountExtensionUi();
+    // Re-check mount after delayed UI hydration in Luker
+    setTimeout(mountExtensionUi, 1200);
+
     const ctx = getCtx();
     if (ctx.SlashCommandParser && ctx.SlashCommand) {
         try {
@@ -1273,9 +1536,15 @@ jQuery(async () => {
                 },
                 helpString: '打开酒馆全量胶囊打包/还原工作台（用法：/capsule 或 /capsule import）',
             }));
-        } catch (e) {
-            console.warn('[ST-Capsule] Slash command registration warning:', e);
-        }
+        } catch {}
     }
-    console.log(`[${EXT_ID}] Loaded successfully.`);
-});
+    console.log(`[${EXT_ID}] v1.2.0 initialized (LukerAndroid=${isLukerAndroidApp()}).`);
+}
+
+if (typeof jQuery !== 'undefined') {
+    jQuery(() => initExtension());
+} else if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initExtension);
+} else {
+    initExtension();
+}
