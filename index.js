@@ -906,6 +906,10 @@ async function openCapsuleModal(initialTab = 'export') {
                       <button type="button" class="stcap-mini-btn" id="stcap-chat-none">清空</button>
                     </div>
                   </div>
+                  <label class="stcap-item" style="background:rgba(102,157,246,0.1);border:1px solid rgba(102,157,246,0.28);">
+                    <input type="checkbox" id="stcap-slim-chat-media" checked />
+                    <span class="stcap-item-label" title="剥离聊天楼层内嵌的生成插图与音频 Base64，100%保留文字、思维链、Swipes与变量">🧹 瘦身：剥离聊天内嵌大图/语音 Base64</span>
+                  </label>
                   <div class="stcap-list">${chatItemsHtml}</div>
                 </div>
 
@@ -1027,6 +1031,7 @@ async function openCapsuleModal(initialTab = 'export') {
 
             const selectedWbs = [...bodyEl.querySelectorAll('.stcap-wb-chk:checked')].map(c => c.value);
             const selectedChats = [...bodyEl.querySelectorAll('.stcap-chat-chk:checked')].map(c => c.value);
+            const slimChatMedia = Boolean(bodyEl.querySelector('#stcap-slim-chat-media')?.checked);
             const selectedPresets = [...bodyEl.querySelectorAll('.stcap-preset-chk:checked')].map(c => c.value);
             const incLivePreset = bodyEl.querySelector('#stcap-inc-live-preset')?.checked;
 
@@ -1111,6 +1116,29 @@ async function openCapsuleModal(initialTab = 'export') {
                 });
             }
 
+            const stripMsgMediaInPlace = (msgs) => {
+                if (!slimChatMedia || !Array.isArray(msgs)) return msgs;
+                const dataUriRe = /data:[a-zA-Z0-9/+.-]+;base64,[A-Za-z0-9+/=\s]{1024,}/g;
+                return msgs.map(raw => {
+                    if (!raw || typeof raw !== 'object') return raw;
+                    const m = safeJsonClone(raw, raw);
+                    if (typeof m.mes === 'string' && m.mes.length > 1200) {
+                        m.mes = m.mes.replace(dataUriRe, '[inline-media-omitted]');
+                    }
+                    if (Array.isArray(m.swipes)) {
+                        m.swipes = m.swipes.map(s => (typeof s === 'string' && s.length > 1200 ? s.replace(dataUriRe, '[inline-media-omitted]') : s));
+                    }
+                    if (m.extra && typeof m.extra === 'object') {
+                        delete m.extra.image;
+                        delete m.extra.inline_image;
+                        delete m.extra.audio;
+                        if (Array.isArray(m.extra.media)) delete m.extra.media;
+                        if (Array.isArray(m.extra.image_swipes)) delete m.extra.image_swipes;
+                    }
+                    return m;
+                });
+            };
+
             // 3. Fetch all selected chat histories
             const chatsOut = [];
             for (let i = 0; i < selectedChats.length; i++) {
@@ -1127,6 +1155,7 @@ async function openCapsuleModal(initialTab = 'export') {
                         messages = [{ user_name: ctx.name1, character_name: inspected.name, chat_metadata: safeJsonClone(ctx.chatMetadata, {}) }, ...safeJsonClone(ctx.chat, [])];
                     }
                     if (Array.isArray(messages) && messages.length > 0) {
+                        messages = stripMsgMediaInPlace(messages);
                         const metaObj = messages[0]?.chat_metadata ? messages[0] : { chat_metadata: {} };
                         const msgCount = messages.filter(m => !m.chat_metadata || m.mes !== undefined).length;
                         chatsOut.push({
