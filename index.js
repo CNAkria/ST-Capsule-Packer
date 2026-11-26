@@ -620,7 +620,11 @@ function sanitizeDownloadName(name) {
 }
 
 function isLukerAndroidApp() {
-    return Boolean(window.LukerAndroid && typeof window.LukerAndroid.saveFileFromDataUrl === 'function');
+    return Boolean(
+        window.LukerAndroid &&
+        (typeof window.LukerAndroid.saveFileFromUrl === 'function' ||
+         typeof window.LukerAndroid.saveFileFromDataUrl === 'function')
+    );
 }
 
 function canShareFileMobile() {
@@ -633,8 +637,41 @@ function canShareFileMobile() {
     return false;
 }
 
-async function saveGeneratedPayload({ bytes, filename, mimeType, useMobileShare = false }) {
-    const blob = new Blob([bytes], { type: mimeType });
+async function stageFileOnLocalServer(uint8Bytes, extSuffix) {
+    try {
+        const asciiTempName = `stcap_${Date.now()}${extSuffix}`;
+        const b64 = uint8ToBase64(uint8Bytes);
+        const resp = await apiPost('/api/files/upload', {
+            name: asciiTempName,
+            data: b64,
+        });
+        if (resp?.path) {
+            const relPath = resp.path.startsWith('/') ? resp.path : `/${resp.path}`;
+            const fullUrl = new URL(relPath, window.location.origin).href;
+            return { ok: true, relPath, fullUrl, asciiTempName };
+        }
+    } catch (err) {
+        console.warn('[ST-Capsule] /api/files/upload staging warning:', err);
+    }
+    return { ok: false, relPath: '', fullUrl: '', asciiTempName: '' };
+}
+
+function triggerHttpAnchorDownload(httpUrl, filename) {
+    const a = document.createElement('a');
+    a.href = httpUrl;
+    a.download = filename;
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 3000);
+}
+
+async function saveGeneratedPayload({ bytes, filename, mimeType, extSuffix, useMobileShare = false }) {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const blob = new Blob([u8], { type: mimeType });
+
+    // Always stage onto SillyTavern/Luker's /user/files/ first so there is zero JNI size limit
+    const staged = await stageFileOnLocalServer(u8, extSuffix);
 
     // 1. Explicit Web Share sheet if user clicked Share button
     if (useMobileShare && navigator.share && typeof File !== 'undefined') {
@@ -642,28 +679,56 @@ async function saveGeneratedPayload({ bytes, filename, mimeType, useMobileShare 
             const fileObj = new File([blob], filename, { type: mimeType });
             if (!navigator.canShare || navigator.canShare({ files: [fileObj] })) {
                 await navigator.share({ title: filename, files: [fileObj] });
-                return { via: 'share', blob };
+                return { via: 'share', blob, staged };
             }
         } catch (err) {
-            if (err?.name === 'AbortError') return { via: 'cancelled', blob };
+            if (err?.name === 'AbortError') return { via: 'cancelled', blob, staged };
             console.warn('[ST-Capsule] Share fallback:', err);
         }
     }
 
-    // 2. Native Luker Android Bridge (MainActivity.kt -> LukerAndroid.saveFileFromDataUrl -> Android SAF Save Dialog)
-    if (isLukerAndroidApp()) {
+    // 2. Preferred Luker Android Stream Bridge (MainActivity.kt -> saveFileFromUrl -> launchSafPickerFor)
+    // Passes only a tiny JSON string across JNI, avoiding WebView @JavascriptInterface multi-MB dataUrl drops!
+    if (staged.ok && window.LukerAndroid && typeof window.LukerAndroid.saveFileFromUrl === 'function') {
         try {
-            const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(await blob.arrayBuffer());
-            const b64 = uint8ToBase64(u8);
-            const dataUrl = `data:${mimeType};base64,${b64}`;
-            window.LukerAndroid.saveFileFromDataUrl(dataUrl, filename, mimeType);
-            return { via: 'luker-android-saf', blob };
+            const ctx = getCtx();
+            const reqHeaders = ctx.getRequestHeaders ? ctx.getRequestHeaders() : {};
+            window.LukerAndroid.saveFileFromUrl(JSON.stringify({
+                url: staged.fullUrl,
+                fileName: filename,
+                mimeType,
+                method: 'GET',
+                headers: reqHeaders,
+            }));
+            return { via: 'luker-stream-saf', blob, staged };
         } catch (err) {
-            console.warn('[ST-Capsule] LukerAndroid bridge fallback to anchor:', err);
+            console.warn('[ST-Capsule] saveFileFromUrl fallback:', err);
         }
     }
 
-    // 3. Standard Browser Anchor Download
+    // 3. Older Luker Android APK: if file <= 1.2 MB use saveFileFromDataUrl; if larger, use real HTTP URL to hit WebView DownloadListener!
+    if (window.LukerAndroid && typeof window.LukerAndroid.saveFileFromDataUrl === 'function') {
+        if (u8.byteLength <= 1_200_000) {
+            try {
+                const dataUrl = `data:${mimeType};base64,${uint8ToBase64(u8)}`;
+                window.LukerAndroid.saveFileFromDataUrl(dataUrl, filename, mimeType);
+                return { via: 'luker-dataurl-saf', blob, staged };
+            } catch (err) {
+                console.warn('[ST-Capsule] saveFileFromDataUrl fallback:', err);
+            }
+        }
+        if (staged.ok) {
+            triggerHttpAnchorDownload(staged.fullUrl, filename);
+            return { via: 'luker-http-download', blob, staged };
+        }
+    }
+
+    // 4. Standard Browser Download (prefer real staged HTTP URL if available, else Blob URL)
+    if (staged.ok) {
+        triggerHttpAnchorDownload(staged.fullUrl, filename);
+        return { via: 'http-download', blob, staged };
+    }
+
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -674,7 +739,7 @@ async function saveGeneratedPayload({ bytes, filename, mimeType, useMobileShare 
         a.remove();
         URL.revokeObjectURL(url);
     }, 15000);
-    return { via: 'browser-download', blob };
+    return { via: 'blob-download', blob, staged };
 }
 
 // ============================================================================
@@ -1158,8 +1223,46 @@ async function openCapsuleModal(initialTab = 'export') {
             const safeBase = sanitizeDownloadName(inspected.name);
             const jsonStr = JSON.stringify(capsuleObj, null, mode === 'json' ? 2 : 0);
 
+            const renderManualSaveBox = (saved, fileName, mimeType, mb) => {
+                let oldBox = bodyEl.querySelector('#stcap-result-box');
+                if (oldBox) oldBox.remove();
+                const box = document.createElement('div');
+                box.id = 'stcap-result-box';
+                box.style.cssText = 'padding:12px;border-radius:10px;background:rgba(6,78,59,0.35);border:1px solid rgba(52,211,153,0.55);display:flex;flex-direction:column;gap:8px;';
+                box.innerHTML = `
+                  <div style="font-size:13px;font-weight:700;color:#6ee7b7;">
+                    ✅ 打包完成：${escapeHtml(fileName)} (${mb} MB · 通道: ${escapeHtml(saved.via)})
+                  </div>
+                  <div style="font-size:11.5px;color:#d1fae5;line-height:1.5;">
+                    ${saved.staged?.ok
+                        ? `文件已同步写入酒馆本地目录：<code>data/default-user${escapeHtml(saved.staged.relPath)}</code>。<br/>如果手机系统未自动弹出「选择保存位置」，请直接点下面任意一种保底方式保存：`
+                        : `如果未自动弹出保存框，请点击下方按钮重试保存：`}
+                  </div>
+                  <div style="display:flex;flex-wrap:wrap;gap:8px;">
+                    ${saved.staged?.ok && window.LukerAndroid?.saveFileFromUrl ? `<button type="button" class="stcap-mini-btn" id="stcap-retry-saf" style="padding:6px 10px;border-color:#34d399;color:#fff;font-weight:600;">📂 重新唤起安卓选择保存位置</button>` : ''}
+                    ${saved.staged?.ok ? `<a href="${escapeHtml(saved.staged.fullUrl)}" download="${escapeHtml(fileName)}" class="stcap-mini-btn" style="padding:6px 10px;border-color:#60a5fa;color:#fff;text-decoration:none;font-weight:600;">⬇️ 直链下载到手机 Download 栏</a>` : ''}
+                    ${saved.staged?.ok ? `<a href="${escapeHtml(saved.staged.fullUrl)}" target="_blank" rel="noopener" class="stcap-mini-btn" style="padding:6px 10px;color:#e2e8f0;text-decoration:none;">🌐 新窗口打开文件直链</a>` : ''}
+                  </div>
+                `;
+                bodyEl.prepend(box);
+                bodyEl.scrollTop = 0;
+                box.querySelector('#stcap-retry-saf')?.addEventListener('click', () => {
+                    try {
+                        window.LukerAndroid.saveFileFromUrl(JSON.stringify({
+                            url: saved.staged.fullUrl,
+                            fileName,
+                            mimeType,
+                            method: 'GET',
+                            headers: getCtx().getRequestHeaders ? getCtx().getRequestHeaders() : {},
+                        }));
+                    } catch (e) {
+                        console.error(e);
+                    }
+                });
+            };
+
             if (mode === 'png') {
-                statusEl.textContent = `正在进行 GZIP 压缩并写入角色卡 PNG 数据块...`;
+                statusEl.textContent = `正在进行 GZIP 压缩并上传至本地暂存服务...`;
                 const compressedChunkText = await compressCapsulePayload(jsonStr);
                 const finalPngBytes = buildCapsulePng(pngBytes, v2Card, compressedChunkText);
                 const fileName = `${safeBase}.capsule.png`;
@@ -1167,26 +1270,27 @@ async function openCapsuleModal(initialTab = 'export') {
                     bytes: finalPngBytes,
                     filename: fileName,
                     mimeType: 'image/png',
+                    extSuffix: '.capsule.png',
                     useMobileShare,
                 });
                 const mb = (finalPngBytes.byteLength / 1024 / 1024).toFixed(2);
-                statusEl.textContent = saved.via === 'luker-android-saf'
-                    ? `✅ 已唤起安卓系统保存框：${fileName} (${mb} MB，请选择保存目录)`
-                    : `✅ 已导出单卡合一 PNG：${fileName} (${mb} MB，含 ${booksOut.length} 本世界书、${chatsOut.length} 段聊天)`;
+                renderManualSaveBox(saved, fileName, 'image/png', mb);
+                statusEl.textContent = `✅ 打包完成：${fileName} (${mb} MB，见上方绿色保存卡片)`;
                 if (window.toastr) window.toastr.success(`已生成 ${fileName} (${mb} MB)`);
             } else {
+                statusEl.textContent = `正在打包并上传至本地暂存服务...`;
                 const jsonBytes = new TextEncoder().encode(jsonStr);
                 const fileName = `${safeBase}.stcapsule.json`;
                 const saved = await saveGeneratedPayload({
                     bytes: jsonBytes,
                     filename: fileName,
                     mimeType: 'application/json',
+                    extSuffix: '.json',
                     useMobileShare,
                 });
                 const mb = (jsonBytes.byteLength / 1024 / 1024).toFixed(2);
-                statusEl.textContent = saved.via === 'luker-android-saf'
-                    ? `✅ 已唤起安卓系统保存框：${fileName} (${mb} MB，请选择保存目录)`
-                    : `✅ 已导出独立全量包：${fileName} (${mb} MB)`;
+                renderManualSaveBox(saved, fileName, 'application/json', mb);
+                statusEl.textContent = `✅ 打包完成：${fileName} (${mb} MB，见上方绿色保存卡片)`;
                 if (window.toastr) window.toastr.success(`已生成 ${fileName} (${mb} MB)`);
             }
         } catch (err) {
