@@ -1,79 +1,399 @@
-// ST Capsule Packer v1.2.0 — Full Compatibility with Luker (Android/Desktop) & SillyTavern
-const EXT_ID = 'ST-Capsule-Packer';
+// ============================================================================
+// ST-Capsule-Packer v2.0.0 — All-in-One Card Native Multi-Worldbook & Preset
+// - Embeds multi-worldbooks (1 primary + N extraBooks), bound OpenAI preset,
+//   and scoped regexes directly inside a SINGLE Character Card (.charx / .png)
+//   via card.data.extensions.st_capsule_manifest + st_capsule_bundle
+// - Mandatory front prefix (e.g. 【AGY1128_01】) on card, all worldbooks, and
+//   bound preset to guarantee zero collisions across versions
+// - Auto-unpacks & binds all worldbooks (calling updateWorldInfoList + exact
+//   strip-.png charLore key) when imported even via SillyTavern's NATIVE
+//   "Import Character" button
+// - Auto-switches to the card's bound preset on CHAT_CHANGED and restores the
+//   user's previous normal preset when switching to other cards
+// - Cascade-deletes ALL prefixed worldbooks and bound preset automatically on
+//   CHARACTER_DELETED when the user deletes the character card
+// - Includes 1-click Prefix/Suffix Batch Cleaner & Luker Android SAF Bridge
+// ============================================================================
 
-// Self-inject critical fallback CSS so hot-install in Luker works even before style.css is reloaded
+const EXT_ID = 'st-capsule-packer';
+const BUNDLE_SPEC = 'st_card_bundle_v2';
+const BUNDLE_PREFIX_MAGIC = 'STBND2:GZIP:';
+const LEGACY_CAP_MAGIC_GZIP = 'STCAP1:GZIP:';
+const LEGACY_CAP_MAGIC_RAW = 'STCAP1:RAW:';
+const LS_LAST_NORMAL_PRESET = 'stcap_v2_last_normal_preset';
+
+let cachedMods = null;
+const installingAvatars = new Set();
+const installedSessionSignatures = new Map(); // avatar -> manifest signature
+
+// ============================================================================
+// 0. Critical Inline CSS (Luker Top-Layer <dialog> Safe)
+// ============================================================================
+const CRITICAL_CSS = `
+dialog.stcap-dialog {
+    padding: 0 !important;
+    border: none !important;
+    background: transparent !important;
+    max-width: 96vw !important;
+    max-height: 92vh !important;
+    width: 840px !important;
+    margin: auto !important;
+    overflow: visible !important;
+    color: #f1f5f9 !important;
+    z-index: 2147483640 !important;
+}
+dialog.stcap-dialog::backdrop {
+    background: rgba(4, 6, 14, 0.80) !important;
+    backdrop-filter: blur(6px) !important;
+    -webkit-backdrop-filter: blur(6px) !important;
+}
+.stcap-overlay-fallback {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 2147483640 !important;
+    background: rgba(4, 6, 14, 0.82) !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 10px !important;
+}
+.stcap-modal {
+    width: 100% !important;
+    max-height: 90vh !important;
+    display: flex !important;
+    flex-direction: column !important;
+    background: rgba(16, 19, 28, 0.98) !important;
+    border: 1px solid rgba(192, 132, 252, 0.45) !important;
+    border-radius: 14px !important;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.88), 0 0 22px rgba(168, 85, 247, 0.25) !important;
+    color: #f1f5f9 !important;
+    overflow: hidden !important;
+    font-family: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif !important;
+    box-sizing: border-box !important;
+}
+.stcap-hazard-bar {
+    height: 6px !important;
+    width: 100% !important;
+    flex-shrink: 0 !important;
+    background: repeating-linear-gradient(-45deg, #facc15 0px, #facc15 12px, #111827 12px, #111827 24px) !important;
+}
+.stcap-header {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    padding: 12px 16px !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1) !important;
+    background: rgba(255, 255, 255, 0.03) !important;
+    flex-shrink: 0 !important;
+}
+.stcap-title-wrap {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    flex-wrap: wrap !important;
+}
+.stcap-title {
+    font-size: 16px !important;
+    font-weight: 700 !important;
+    color: #ffffff !important;
+    text-shadow: 0 0 10px rgba(192, 132, 252, 0.65) !important;
+}
+.stcap-neon-tag {
+    font-size: 11px !important;
+    padding: 2px 8px !important;
+    border-radius: 999px !important;
+    background: rgba(74, 222, 128, 0.14) !important;
+    border: 1px solid rgba(74, 222, 128, 0.45) !important;
+    color: #4ade80 !important;
+    font-weight: 600 !important;
+}
+.stcap-close {
+    cursor: pointer !important;
+    background: rgba(255, 255, 255, 0.08) !important;
+    border: 1px solid rgba(255, 255, 255, 0.18) !important;
+    color: #f1f5f9 !important;
+    width: 32px !important;
+    height: 32px !important;
+    border-radius: 8px !important;
+    font-size: 16px !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+}
+.stcap-tabs {
+    display: flex !important;
+    gap: 6px !important;
+    padding: 8px 14px 0 !important;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+    flex-shrink: 0 !important;
+    overflow-x: auto !important;
+}
+.stcap-tab {
+    padding: 8px 12px !important;
+    border-radius: 8px 8px 0 0 !important;
+    cursor: pointer !important;
+    font-size: 13px !important;
+    font-weight: 600 !important;
+    color: #94a3b8 !important;
+    background: transparent !important;
+    border: 1px solid transparent !important;
+    border-bottom: none !important;
+    white-space: nowrap !important;
+}
+.stcap-tab.active {
+    color: #f8fafc !important;
+    background: rgba(168, 85, 247, 0.18) !important;
+    border-color: rgba(192, 132, 252, 0.4) !important;
+}
+.stcap-body {
+    padding: 14px 16px !important;
+    overflow-y: auto !important;
+    flex: 1 1 auto !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 12px !important;
+    -webkit-overflow-scrolling: touch !important;
+}
+.stcap-char-banner {
+    display: flex !important;
+    align-items: center !important;
+    gap: 12px !important;
+    padding: 10px 12px !important;
+    border-radius: 10px !important;
+    background: linear-gradient(90deg, rgba(168, 85, 247, 0.16), rgba(59, 130, 246, 0.10)) !important;
+    border: 1px solid rgba(192, 132, 252, 0.3) !important;
+}
+.stcap-char-banner img {
+    width: 48px !important;
+    height: 48px !important;
+    border-radius: 8px !important;
+    object-fit: cover !important;
+    border: 1px solid rgba(255, 255, 255, 0.25) !important;
+    flex-shrink: 0 !important;
+}
+.stcap-char-meta { min-width: 0 !important; flex: 1 !important; }
+.stcap-char-name {
+    font-size: 14px !important;
+    font-weight: 700 !important;
+    color: #fff !important;
+    word-break: break-all !important;
+}
+.stcap-char-sub { font-size: 12px !important; color: #cbd5e1 !important; margin-top: 2px !important; }
+.stcap-grid {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)) !important;
+    gap: 10px !important;
+}
+.stcap-section {
+    background: rgba(255, 255, 255, 0.035) !important;
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    border-radius: 10px !important;
+    padding: 10px 12px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 7px !important;
+}
+.stcap-section-head {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    gap: 6px !important;
+    flex-wrap: wrap !important;
+}
+.stcap-section-title { font-size: 13px !important; font-weight: 700 !important; color: #e2e8f0 !important; }
+.stcap-mini-actions { display: flex !important; gap: 5px !important; }
+.stcap-mini-btn {
+    font-size: 11px !important;
+    padding: 2px 8px !important;
+    border-radius: 5px !important;
+    cursor: pointer !important;
+    background: rgba(255, 255, 255, 0.08) !important;
+    border: 1px solid rgba(255, 255, 255, 0.16) !important;
+    color: #cbd5e1 !important;
+}
+.stcap-search {
+    width: 100% !important;
+    padding: 6px 9px !important;
+    border-radius: 6px !important;
+    border: 1px solid rgba(255, 255, 255, 0.18) !important;
+    background: rgba(0, 0, 0, 0.35) !important;
+    color: #f8fafc !important;
+    font-size: 12px !important;
+    box-sizing: border-box !important;
+}
+.stcap-list {
+    max-height: 175px !important;
+    overflow-y: auto !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 3px !important;
+}
+.stcap-item {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    padding: 5px 7px !important;
+    border-radius: 6px !important;
+    cursor: pointer !important;
+    font-size: 12px !important;
+    color: #e2e8f0 !important;
+}
+.stcap-item:hover { background: rgba(255, 255, 255, 0.06) !important; }
+.stcap-item input[type="checkbox"], .stcap-item input[type="radio"] {
+    accent-color: #a855f7 !important;
+    width: 16px !important;
+    height: 16px !important;
+    flex-shrink: 0 !important;
+}
+.stcap-item-label {
+    flex: 1 !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+}
+.stcap-item-sub {
+    font-size: 10px !important;
+    color: #c084fc !important;
+    padding: 1px 6px !important;
+    border-radius: 4px !important;
+    background: rgba(168, 85, 247, 0.16) !important;
+    flex-shrink: 0 !important;
+}
+.stcap-footer {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    padding: 10px 14px !important;
+    border-top: 1px solid rgba(255, 255, 255, 0.1) !important;
+    background: rgba(0, 0, 0, 0.35) !important;
+    gap: 8px !important;
+    flex-wrap: wrap !important;
+    flex-shrink: 0 !important;
+}
+.stcap-status { font-size: 12px !important; color: #93c5fd !important; flex: 1 1 200px !important; }
+.stcap-primary-btn {
+    padding: 8px 14px !important;
+    border-radius: 8px !important;
+    border: 1px solid rgba(192, 132, 252, 0.6) !important;
+    background: linear-gradient(135deg, #7e22ce, #4f46e5) !important;
+    color: #fff !important;
+    font-weight: 700 !important;
+    font-size: 12px !important;
+    cursor: pointer !important;
+}
+.stcap-primary-btn:disabled { opacity: 0.5 !important; cursor: not-allowed !important; }
+.stcap-secondary-btn {
+    padding: 8px 12px !important;
+    border-radius: 8px !important;
+    border: 1px solid rgba(255, 255, 255, 0.22) !important;
+    background: rgba(255, 255, 255, 0.08) !important;
+    color: #f1f5f9 !important;
+    font-weight: 600 !important;
+    font-size: 12px !important;
+    cursor: pointer !important;
+}
+.stcap-danger-btn {
+    padding: 6px 12px !important;
+    border-radius: 7px !important;
+    border: 1px solid rgba(248, 113, 113, 0.55) !important;
+    background: rgba(220, 38, 38, 0.22) !important;
+    color: #fca5a5 !important;
+    font-weight: 700 !important;
+    font-size: 12px !important;
+    cursor: pointer !important;
+}
+.stcap-dropzone {
+    border: 2px dashed rgba(192, 132, 252, 0.45) !important;
+    border-radius: 10px !important;
+    padding: 18px !important;
+    text-align: center !important;
+    cursor: pointer !important;
+    background: rgba(168, 85, 247, 0.06) !important;
+}
+.stcap-drawer-box { display: flex; flex-direction: column; gap: 8px; padding: 8px 4px; font-size: 12px; }
+.stcap-btn-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.stcap-trigger-btn {
+    flex: 1 1 130px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid rgba(192, 132, 252, 0.45);
+    background: linear-gradient(135deg, rgba(88, 28, 135, 0.55), rgba(30, 41, 59, 0.85));
+    color: #f8fafc;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: center;
+}
+`;
+
 function ensureCriticalStyles() {
-    if (document.getElementById('stcap-critical-css')) return;
-    const style = document.createElement('style');
-    style.id = 'stcap-critical-css';
-    style.textContent = `
-      dialog.stcap-dialog { padding:0; margin:auto; border:none; background:transparent; width:min(920px,96vw); max-width:96vw; max-height:92dvh; color:#f2f2f7; z-index:2147483645; }
-      dialog.stcap-dialog::backdrop { background:rgba(6,7,11,0.82); backdrop-filter:blur(6px); }
-      .stcap-overlay-fallback { position:fixed !important; inset:0 !important; z-index:2147483645 !important; background:rgba(6,7,11,0.82); display:flex; align-items:center; justify-content:center; padding:10px; box-sizing:border-box; }
-      .stcap-modal { width:100%; max-height:90dvh; display:flex; flex-direction:column; background:#101219; border:1px solid rgba(218,228,255,0.2); border-radius:14px; box-shadow:0 24px 64px rgba(0,0,0,0.85); color:#f2f2f7; overflow:hidden; box-sizing:border-box; }
-      .stcap-body { padding:14px 16px; overflow-y:auto; -webkit-overflow-scrolling:touch; flex:1; display:flex; flex-direction:column; gap:12px; }
-      .stcap-footer { padding:10px 16px; border-top:1px solid rgba(255,255,255,0.1); background:#0b0d12; display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; }
-      .stcap-trigger-btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:8px 13px; min-height:38px; border-radius:8px; border:1px solid rgba(102,157,246,0.55); background:#1a1e2c; color:#f4f4f8 !important; font-weight:600; font-size:13px; cursor:pointer; }
-    `;
-    document.head.appendChild(style);
-}
-
-// ============================================================================
-// Dynamic Host Module Bridge (Works on Luker + Vanilla SillyTavern safely)
-// ============================================================================
-let hostMods = null;
-
-async function getHostMods() {
-    if (hostMods) return hostMods;
-    const safeImport = async (relPath) => {
-        try {
-            return await import(new URL(relPath, import.meta.url).href);
-        } catch (e1) {
-            try {
-                const absPath = relPath.replace(/^(\.\.\/)+/, '/scripts/');
-                return await import(absPath);
-            } catch {
-                return {};
-            }
-        }
-    };
-
-    const [extMod, pmMod, puMod, wiMod, openaiMod] = await Promise.all([
-        safeImport('../../../extensions.js'),
-        safeImport('../../../preset-manager.js'),
-        safeImport('../../../power-user.js'),
-        safeImport('../../../world-info.js'),
-        safeImport('../../../openai.js'),
-    ]);
-
-    hostMods = { extMod, pmMod, puMod, wiMod, openaiMod };
-    return hostMods;
-}
-
-function getCtx() {
-    try {
-        if (window.Luker?.getContext) return window.Luker.getContext() || {};
-        if (window.SillyTavern?.getContext) return window.SillyTavern.getContext() || {};
-        if (window.lukerContext) return window.lukerContext;
-    } catch (e) {
-        console.warn('[ST-Capsule] getContext fallback:', e);
-    }
-    return {};
-}
-
-function safeJsonClone(val, fallback = {}) {
-    if (val === undefined || val === null) return fallback;
-    try {
-        return JSON.parse(JSON.stringify(val));
-    } catch {
-        return fallback;
+    if (!document.getElementById('stcap-critical-inline-css')) {
+        const styleEl = document.createElement('style');
+        styleEl.id = 'stcap-critical-inline-css';
+        styleEl.textContent = CRITICAL_CSS;
+        document.head.appendChild(styleEl);
     }
 }
 
 // ============================================================================
-// Pure Browser PNG Chunk & GZIP Codec
+// 1. Prefix Normalization & Stripping Utilities
 // ============================================================================
-const PNG_SIG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+const FRONT_PREFIX_RE = /^(?:【[^】]{1,32}】|\[[^\]]{1,32}\])\s*/;
+const TAIL_SUFFIX_RE = /\s*(?:【[^】]{1,32}】|\[AGY[^\]]*\]|\[ST[^\]]*\])$/i;
+
+function stripAnyBundleAffixes(rawName) {
+    return String(rawName || '')
+        .replace(FRONT_PREFIX_RE, '')
+        .replace(TAIL_SUFFIX_RE, '')
+        .trim();
+}
+
+function normalizeFrontPrefix(rawPrefix) {
+    const trimmed = String(rawPrefix || '').trim();
+    if (!trimmed) return makeFreshPrefix();
+    if ((trimmed.startsWith('【') && trimmed.endsWith('】')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        return trimmed;
+    }
+    return `【${trimmed.replace(/[【】\[\]<>:"/\\|?*]/g, '')}】`;
+}
+
+function applyFrontPrefix(prefix, rawName) {
+    const cleanPfx = normalizeFrontPrefix(prefix);
+    const base = stripAnyBundleAffixes(rawName) || 'Unnamed';
+    return `${cleanPfx}${base}`;
+}
+
+function makeFreshPrefix(tag = 'ST') {
+    const d = new Date();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mi = String(d.getMinutes()).padStart(2, '0');
+    const ss = String(d.getSeconds()).padStart(2, '0');
+    return `【${tag}${mm}${dd}_${hh}${mi}${ss}】`;
+}
+
+function extractLeadingPrefix(name) {
+    const m = String(name || '').match(/^(【[^】]{1,32}】|\[[^\]]{1,32}\])/);
+    return m ? m[1] : '';
+}
+
+function extractTrailingTag(name) {
+    const m = String(name || '').match(/\s*(\[(?:AGY|ST)[^\]]+\])$/i);
+    return m ? m[1] : '';
+}
+
+function getCharKeyWithoutExt(avatarOrName) {
+    return String(avatarOrName || '').replace(/\.[^/.]+$/, '');
+}
+
+// ============================================================================
+// 2. Binary, CRC32, GZIP, PNG Chunks & Pure-JS ZIP (.charx) Builder/Reader
+// ============================================================================
+const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+const ZIP_LOCAL_SIG = 0x04034b50;
+const ZIP_CENTRAL_SIG = 0x02014b50;
+const ZIP_EOCD_SIG = 0x06054b50;
 
 const CRC_TABLE = (() => {
     const table = new Uint32Array(256);
@@ -87,102 +407,25 @@ const CRC_TABLE = (() => {
     return table;
 })();
 
-function crc32(bytes, start = 0, end = bytes.length) {
+function crc32(bytes) {
     let c = 0xffffffff;
-    for (let i = start; i < end; i++) {
+    for (let i = 0; i < bytes.length; i++) {
         c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
     }
     return (c ^ 0xffffffff) >>> 0;
 }
 
-function readUint32BE(buf, offset) {
-    return ((buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0;
-}
-
-function writeUint32BE(buf, offset, val) {
-    buf[offset] = (val >>> 24) & 0xff;
-    buf[offset + 1] = (val >>> 16) & 0xff;
-    buf[offset + 2] = (val >>> 8) & 0xff;
-    buf[offset + 3] = val & 0xff;
-}
-
-function extractPngChunks(uint8) {
-    for (let i = 0; i < 8; i++) {
-        if (uint8[i] !== PNG_SIG[i]) throw new Error('Invalid PNG signature');
+function uint8ToBase64(u8) {
+    const CHUNK = 0x8000;
+    const parts = [];
+    for (let i = 0; i < u8.length; i += CHUNK) {
+        parts.push(String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK)));
     }
-    const chunks = [];
-    let offset = 8;
-    while (offset + 8 <= uint8.length) {
-        const length = readUint32BE(uint8, offset);
-        const name = String.fromCharCode(uint8[offset + 4], uint8[offset + 5], uint8[offset + 6], uint8[offset + 7]);
-        const dataStart = offset + 8;
-        const dataEnd = dataStart + length;
-        if (dataEnd + 4 > uint8.length) break;
-        chunks.push({ name, data: uint8.slice(dataStart, dataEnd) });
-        offset = dataEnd + 4;
-        if (name === 'IEND') break;
-    }
-    return chunks;
-}
-
-function encodePngChunks(chunks) {
-    let total = 8;
-    for (const ch of chunks) total += 12 + ch.data.length;
-    const out = new Uint8Array(total);
-    out.set(PNG_SIG, 0);
-    let offset = 8;
-    for (const ch of chunks) {
-        writeUint32BE(out, offset, ch.data.length);
-        for (let i = 0; i < 4; i++) out[offset + 4 + i] = ch.name.charCodeAt(i) & 0xff;
-        out.set(ch.data, offset + 8);
-        const crc = crc32(out, offset + 4, offset + 8 + ch.data.length);
-        writeUint32BE(out, offset + 8 + ch.data.length, crc);
-        offset += 12 + ch.data.length;
-    }
-    return out;
-}
-
-function makeTextChunk(keyword, asciiText) {
-    const keyBytes = new Uint8Array(keyword.length);
-    for (let i = 0; i < keyword.length; i++) keyBytes[i] = keyword.charCodeAt(i) & 0xff;
-    const valBytes = new Uint8Array(asciiText.length);
-    for (let i = 0; i < asciiText.length; i++) valBytes[i] = asciiText.charCodeAt(i) & 0xff;
-    const data = new Uint8Array(keyBytes.length + 1 + valBytes.length);
-    data.set(keyBytes, 0);
-    data[keyBytes.length] = 0;
-    data.set(valBytes, keyBytes.length + 1);
-    return { name: 'tEXt', data };
-}
-
-function decodeTextChunk(data) {
-    let nul = -1;
-    for (let i = 0; i < data.length; i++) {
-        if (data[i] === 0) { nul = i; break; }
-    }
-    if (nul < 0) return null;
-    let keyword = '';
-    for (let i = 0; i < nul; i++) keyword += String.fromCharCode(data[i]);
-    const textBytes = data.subarray(nul + 1);
-    let text = '';
-    const step = 32768;
-    for (let i = 0; i < textBytes.length; i += step) {
-        text += String.fromCharCode(...textBytes.subarray(i, i + step));
-    }
-    return { keyword, text };
-}
-
-function uint8ToBase64(uint8) {
-    let bin = '';
-    const step = 32768;
-    for (let i = 0; i < uint8.length; i += step) {
-        bin += String.fromCharCode(...uint8.subarray(i, i + step));
-    }
-    return btoa(bin);
+    return btoa(parts.join(''));
 }
 
 function base64ToUint8(b64) {
-    const clean = b64.replace(/\s+/g, '');
-    const bin = atob(clean);
+    const bin = atob(b64);
     const out = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
@@ -196,415 +439,398 @@ function base64ToUtf8(b64) {
     return new TextDecoder('utf-8').decode(base64ToUint8(b64));
 }
 
-async function compressCapsulePayload(jsonStr) {
-    const rawBytes = new TextEncoder().encode(jsonStr);
+async function gzipStringToBase64(str) {
+    const raw = new TextEncoder().encode(str);
     if (typeof CompressionStream !== 'undefined') {
-        try {
-            const cs = new CompressionStream('gzip');
-            const writer = cs.writable.getWriter();
-            writer.write(rawBytes);
-            writer.close();
-            const compressedBuf = await new Response(cs.readable).arrayBuffer();
-            return 'STCAP1:GZIP:' + uint8ToBase64(new Uint8Array(compressedBuf));
-        } catch (err) {
-            console.warn('[ST-Capsule] GZIP fallback to RAW:', err);
-        }
+        const cs = new CompressionStream('gzip');
+        const writer = cs.writable.getWriter();
+        writer.write(raw);
+        writer.close();
+        const compressedBuf = await new Response(cs.readable).arrayBuffer();
+        return BUNDLE_PREFIX_MAGIC + uint8ToBase64(new Uint8Array(compressedBuf));
     }
-    return 'STCAP1:RAW:' + uint8ToBase64(rawBytes);
+    return 'STBND2:RAW:' + uint8ToBase64(raw);
 }
 
-async function decompressCapsulePayload(payloadStr) {
-    if (payloadStr.startsWith('STCAP1:GZIP:')) {
-        if (typeof DecompressionStream === 'undefined') {
-            throw new Error('当前 WebView 内核不支持 GZIP 解压，请升级 Android System WebView 或使用 .stcapsule.json。');
-        }
-        const b64 = payloadStr.slice('STCAP1:GZIP:'.length);
-        const compressed = base64ToUint8(b64);
+async function decodeBundlePayload(encodedStr) {
+    if (!encodedStr || typeof encodedStr !== 'string') throw new Error('空数据包');
+    if (encodedStr.startsWith(BUNDLE_PREFIX_MAGIC) || encodedStr.startsWith(LEGACY_CAP_MAGIC_GZIP)) {
+        const pfxLen = encodedStr.startsWith(BUNDLE_PREFIX_MAGIC) ? BUNDLE_PREFIX_MAGIC.length : LEGACY_CAP_MAGIC_GZIP.length;
+        const compBytes = base64ToUint8(encodedStr.slice(pfxLen));
         const ds = new DecompressionStream('gzip');
         const writer = ds.writable.getWriter();
-        writer.write(compressed);
+        writer.write(compBytes);
         writer.close();
-        const rawBuf = await new Response(ds.readable).arrayBuffer();
-        return JSON.parse(new TextDecoder('utf-8').decode(rawBuf));
+        const decompBuf = await new Response(ds.readable).arrayBuffer();
+        return JSON.parse(new TextDecoder('utf-8').decode(decompBuf));
     }
-    if (payloadStr.startsWith('STCAP1:RAW:')) {
-        const b64 = payloadStr.slice('STCAP1:RAW:'.length);
-        return JSON.parse(base64ToUtf8(b64));
+    if (encodedStr.startsWith('STBND2:RAW:') || encodedStr.startsWith(LEGACY_CAP_MAGIC_RAW)) {
+        const idx = encodedStr.indexOf(':', 7) + 1;
+        return JSON.parse(base64ToUtf8(encodedStr.slice(idx)));
     }
-    if (payloadStr.trim().startsWith('{')) {
-        return JSON.parse(payloadStr);
-    }
-    return JSON.parse(base64ToUtf8(payloadStr));
+    return JSON.parse(base64ToUtf8(encodedStr));
 }
 
-function buildCapsulePng(originalPngBytes, v2CardObj, capsulePayloadEncoded) {
-    const chunks = extractPngChunks(originalPngBytes).filter(ch => {
-        if (ch.name !== 'tEXt') return true;
-        const dec = decodeTextChunk(ch.data);
-        if (!dec) return true;
-        const kw = dec.keyword.toLowerCase();
-        return kw !== 'chara' && kw !== 'ccv3' && kw !== 'st_capsule';
-    });
+function isPngBytes(u8) {
+    if (!u8 || u8.length < 8) return false;
+    for (let i = 0; i < 8; i++) if (u8[i] !== PNG_SIGNATURE[i]) return false;
+    return true;
+}
 
+function isZipBytes(u8) {
+    return Boolean(u8 && u8.length >= 4 && u8[0] === 0x50 && u8[1] === 0x4b && u8[2] === 0x03 && u8[3] === 0x04);
+}
+
+function extractPngChunks(u8) {
+    if (!isPngBytes(u8)) throw new Error('不是合法的 PNG 文件');
+    const chunks = [];
+    const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    let offset = 8;
+    while (offset + 8 <= u8.length) {
+        const length = view.getUint32(offset, false);
+        const name = String.fromCharCode(u8[offset + 4], u8[offset + 5], u8[offset + 6], u8[offset + 7]);
+        const dataStart = offset + 8;
+        const dataEnd = dataStart + length;
+        if (dataEnd + 4 > u8.length) break;
+        chunks.push({ name, data: u8.slice(dataStart, dataEnd) });
+        offset = dataEnd + 4;
+        if (name === 'IEND') break;
+    }
+    return chunks;
+}
+
+function decodeTextChunk(data) {
+    let nulIdx = -1;
+    for (let i = 0; i < data.length; i++) {
+        if (data[i] === 0) { nulIdx = i; break; }
+    }
+    if (nulIdx < 0) return null;
+    const keyword = new TextDecoder('latin1').decode(data.subarray(0, nulIdx));
+    const text = new TextDecoder('latin1').decode(data.subarray(nulIdx + 1));
+    return { keyword, text };
+}
+
+function makeTextChunk(keyword, asciiText) {
+    const keyBytes = new TextEncoder().encode(keyword);
+    const valBytes = new TextEncoder().encode(asciiText);
+    const data = new Uint8Array(keyBytes.length + 1 + valBytes.length);
+    data.set(keyBytes, 0);
+    data[keyBytes.length] = 0;
+    data.set(valBytes, keyBytes.length + 1);
+    return { name: 'tEXt', data };
+}
+
+function encodePngChunks(chunks) {
+    let total = 8;
+    for (const c of chunks) total += 12 + c.data.length;
+    const out = new Uint8Array(total);
+    out.set(PNG_SIGNATURE, 0);
+    const view = new DataView(out.buffer);
+    let offset = 8;
+    for (const c of chunks) {
+        const len = c.data.length;
+        view.setUint32(offset, len, false);
+        for (let i = 0; i < 4; i++) out[offset + 4 + i] = c.name.charCodeAt(i);
+        out.set(c.data, offset + 8);
+        const crcVal = crc32(out.subarray(offset + 4, offset + 8 + len));
+        view.setUint32(offset + 8 + len, crcVal, false);
+        offset += 12 + len;
+    }
+    return out;
+}
+
+function buildCleanCardPngBytes(rawPngBytes, v2CardObj) {
+    const chunks = extractPngChunks(rawPngBytes).filter(ch => {
+        if (ch.name !== 'tEXt' && ch.name !== 'zTXt' && ch.name !== 'iTXt') return true;
+        if (ch.name === 'tEXt') {
+            const dec = decodeTextChunk(ch.data);
+            return !dec || !['chara', 'ccv3', 'st_capsule'].includes(dec.keyword.toLowerCase());
+        }
+        return false;
+    });
     const v2Str = JSON.stringify(v2CardObj);
     const v3Obj = JSON.parse(v2Str);
     v3Obj.spec = 'chara_card_v3';
     v3Obj.spec_version = '3.0';
     const v3Str = JSON.stringify(v3Obj);
-
-    const iendIdx = chunks.findIndex(c => c.name === 'IEND');
-    const insertAt = iendIdx >= 0 ? iendIdx : chunks.length;
-
+    const iend = chunks.findIndex(c => c.name === 'IEND');
     chunks.splice(
-        insertAt,
+        iend >= 0 ? iend : chunks.length,
         0,
         makeTextChunk('chara', utf8ToBase64(v2Str)),
         makeTextChunk('ccv3', utf8ToBase64(v3Str)),
-        makeTextChunk('st_capsule', capsulePayloadEncoded),
     );
     return encodePngChunks(chunks);
 }
 
-async function parseAnyCapsuleOrCardFile(file) {
-    const buf = new Uint8Array(await file.arrayBuffer());
-    const isPng = buf.length > 8 && buf[0] === 137 && buf[1] === 80 && buf[2] === 78 && buf[3] === 71;
+function stripPngToPureImage(rawPngBytes) {
+    const chunks = extractPngChunks(rawPngBytes).filter(ch => ch.name !== 'tEXt' && ch.name !== 'zTXt' && ch.name !== 'iTXt');
+    return encodePngChunks(chunks);
+}
 
-    if (isPng) {
-        const chunks = extractPngChunks(buf);
-        let capsuleText = null;
-        let ccv3Text = null;
-        let charaText = null;
-        for (const ch of chunks) {
-            if (ch.name === 'tEXt') {
-                const dec = decodeTextChunk(ch.data);
-                if (!dec) continue;
-                const kw = dec.keyword.toLowerCase();
-                if (kw === 'st_capsule') capsuleText = dec.text;
-                else if (kw === 'ccv3') ccv3Text = dec.text;
-                else if (kw === 'chara') charaText = dec.text;
-            }
-        }
-        if (capsuleText) {
-            const capsule = await decompressCapsulePayload(capsuleText);
-            capsule._raw_png_bytes = buf;
-            return { type: 'capsule', capsule };
-        }
-        const cardJson = ccv3Text ? base64ToUtf8(ccv3Text) : (charaText ? base64ToUtf8(charaText) : null);
-        if (!cardJson) throw new Error('该 PNG 中未检测到角色卡 (chara/ccv3) 或胶囊数据 (st_capsule)。');
-        const card = JSON.parse(cardJson);
-        return {
-            type: 'card_only',
-            capsule: {
-                spec: 'st_capsule_v1',
-                version: '1.2.0',
-                exported_at: new Date().toISOString(),
-                character: {
-                    name: card?.data?.name || card?.name || file.name.replace(/\.png$/i, ''),
-                    avatar: file.name,
-                    card,
-                },
-                presets: { items: [] },
-                regex: { global: [], scoped: card?.data?.extensions?.regex_scripts || [], preset: [] },
-                tavern_helper: { global_scripts: [], character_scripts: card?.data?.extensions?.TavernHelper_scripts || [] },
-                worldbooks: {
-                    bindings: { primary: card?.data?.extensions?.world || null, extra: [], global: [], chat_bound: [] },
-                    books: card?.data?.character_book ? [{
-                        name: card.data.character_book.name || (card?.data?.name + '_embedded'),
-                        roles: ['embedded'],
-                        data: card.data.character_book,
-                    }] : [],
-                },
-                chats: [],
-                _raw_png_bytes: buf,
-            },
-        };
+// Pure-JS STORE ZIP Builder for .charx (100% compatible with SillyTavern CharXParser)
+function buildStoreZipBytes(entries) {
+    // entries: [{ path: string, data: Uint8Array }]
+    const enc = new TextEncoder();
+    const localParts = [];
+    const centralParts = [];
+    let offset = 0;
+
+    for (const entry of entries) {
+        const nameBytes = enc.encode(entry.path);
+        const data = entry.data instanceof Uint8Array ? entry.data : new Uint8Array(entry.data);
+        const crc = crc32(data);
+
+        const localHdr = new Uint8Array(30 + nameBytes.length);
+        const lv = new DataView(localHdr.buffer);
+        lv.setUint32(0, ZIP_LOCAL_SIG, true);
+        lv.setUint16(4, 20, true);      // version needed
+        lv.setUint16(6, 0x0800, true);  // UTF-8 flag
+        lv.setUint16(8, 0, true);       // method 0 = STORE
+        lv.setUint16(10, 0, true);
+        lv.setUint16(12, 0x21, true);
+        lv.setUint32(14, crc, true);
+        lv.setUint32(18, data.length, true);
+        lv.setUint32(22, data.length, true);
+        lv.setUint16(26, nameBytes.length, true);
+        lv.setUint16(28, 0, true);
+        localHdr.set(nameBytes, 30);
+
+        const centralHdr = new Uint8Array(46 + nameBytes.length);
+        const cv = new DataView(centralHdr.buffer);
+        cv.setUint32(0, ZIP_CENTRAL_SIG, true);
+        cv.setUint16(4, 20, true);
+        cv.setUint16(6, 20, true);
+        cv.setUint16(8, 0x0800, true);
+        cv.setUint16(10, 0, true);
+        cv.setUint16(12, 0, true);
+        cv.setUint16(14, 0x21, true);
+        cv.setUint32(16, crc, true);
+        cv.setUint32(20, data.length, true);
+        cv.setUint32(24, data.length, true);
+        cv.setUint16(28, nameBytes.length, true);
+        cv.setUint16(30, 0, true);
+        cv.setUint16(32, 0, true);
+        cv.setUint16(34, 0, true);
+        cv.setUint16(36, 0, true);
+        cv.setUint32(38, 0, true);
+        cv.setUint32(42, offset, true);
+        centralHdr.set(nameBytes, 46);
+
+        localParts.push(localHdr, data);
+        centralParts.push(centralHdr);
+        offset += localHdr.length + data.length;
     }
 
-    const text = new TextDecoder('utf-8').decode(buf);
-    const parsed = JSON.parse(text);
-    if (parsed.spec === 'st_capsule_v1') {
-        return { type: 'capsule', capsule: parsed };
+    let centralSize = 0;
+    for (const c of centralParts) centralSize += c.length;
+
+    const eocd = new Uint8Array(22);
+    const ev = new DataView(eocd.buffer);
+    ev.setUint32(0, ZIP_EOCD_SIG, true);
+    ev.setUint16(4, 0, true);
+    ev.setUint16(6, 0, true);
+    ev.setUint16(8, entries.length, true);
+    ev.setUint16(10, entries.length, true);
+    ev.setUint32(12, centralSize, true);
+    ev.setUint32(16, offset, true);
+    ev.setUint16(20, 0, true);
+
+    const out = new Uint8Array(offset + centralSize + 22);
+    let pos = 0;
+    for (const p of localParts) { out.set(p, pos); pos += p.length; }
+    for (const p of centralParts) { out.set(p, pos); pos += p.length; }
+    out.set(eocd, pos);
+    return out;
+}
+
+async function readFilesFromZipBytes(u8) {
+    const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const files = new Map();
+    let eocdPos = -1;
+    for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) {
+        if (view.getUint32(i, true) === ZIP_EOCD_SIG) { eocdPos = i; break; }
     }
-    if (parsed.spec === 'chara_card_v2' || parsed.spec === 'chara_card_v3' || parsed.data?.name || parsed.first_mes !== undefined) {
-        return {
-            type: 'card_only',
-            capsule: {
-                spec: 'st_capsule_v1',
-                version: '1.2.0',
-                character: { name: parsed?.data?.name || parsed?.name || 'Character', card: parsed },
-                presets: { items: [] },
-                regex: { global: [], scoped: parsed?.data?.extensions?.regex_scripts || [], preset: [] },
-                tavern_helper: { global_scripts: [], character_scripts: [] },
-                worldbooks: { bindings: {}, books: [] },
-                chats: [],
-            },
-        };
+    if (eocdPos < 0) throw new Error('无效的 CharX / ZIP 文件结构');
+    const totalEntries = view.getUint16(eocdPos + 10, true);
+    let cdPos = view.getUint32(eocdPos + 16, true);
+    const dec = new TextDecoder('utf-8');
+
+    for (let idx = 0; idx < totalEntries && cdPos + 46 <= u8.length; idx++) {
+        if (view.getUint32(cdPos, true) !== ZIP_CENTRAL_SIG) break;
+        const method = view.getUint16(cdPos + 10, true);
+        const compSize = view.getUint32(cdPos + 20, true);
+        const nameLen = view.getUint16(cdPos + 28, true);
+        const extraLen = view.getUint16(cdPos + 30, true);
+        const commentLen = view.getUint16(cdPos + 32, true);
+        const localOffset = view.getUint32(cdPos + 42, true);
+        const name = dec.decode(u8.subarray(cdPos + 46, cdPos + 46 + nameLen));
+        cdPos += 46 + nameLen + extraLen + commentLen;
+
+        if (localOffset + 30 > u8.length) continue;
+        const lNameLen = view.getUint16(localOffset + 26, true);
+        const lExtraLen = view.getUint16(localOffset + 28, true);
+        const dataStart = localOffset + 30 + lNameLen + lExtraLen;
+        const rawSlice = u8.subarray(dataStart, dataStart + compSize);
+
+        if (method === 0) {
+            files.set(name, rawSlice);
+        } else if (method === 8 && typeof DecompressionStream !== 'undefined') {
+            const ds = new DecompressionStream('deflate-raw');
+            const w = ds.writable.getWriter();
+            w.write(rawSlice);
+            w.close();
+            const ab = await new Response(ds.readable).arrayBuffer();
+            files.set(name, new Uint8Array(ab));
+        }
     }
-    throw new Error('无法识别的文件格式，请选入 .capsule.png、普通角色卡 .png 或 .stcapsule.json。');
+    return files;
+}
+
+function buildCharXBytes(pureAvatarPngBytes, v2CardObj) {
+    const v3Card = JSON.parse(JSON.stringify(v2CardObj));
+    v3Card.spec = 'chara_card_v3';
+    v3Card.spec_version = '3.0';
+    v3Card.data = v3Card.data || {};
+    v3Card.data.assets = [
+        {
+            type: 'icon',
+            uri: 'embeded://assets/icon/main.png',
+            name: 'main',
+            ext: 'png',
+        },
+    ];
+    const cardJsonBytes = new TextEncoder().encode(JSON.stringify(v3Card));
+    return buildStoreZipBytes([
+        { path: 'card.json', data: cardJsonBytes },
+        { path: 'assets/icon/main.png', data: pureAvatarPngBytes },
+    ]);
 }
 
 // ============================================================================
-// Data Collectors & Native Luker Android Save Handoff
+// 3. Embedded TavernHelper Fallback Script Builder (Dual-Engine Insurance)
 // ============================================================================
-async function apiPost(url, body) {
-    const ctx = getCtx();
+function buildEmbeddedTavernHelperBootstrapScript(prefix) {
+    // Runs inside TavernHelper's character script iframe if enabled; silently skips if
+    // ST-Capsule-Packer v2.0 is already active in parent window, otherwise self-installs!
+    const scriptCode = `
+(async () => {
+  try {
+    const hostWin = window.parent || window;
+    if (hostWin.__ST_CAPSULE_PACKER_V2_ACTIVE__) return;
+    const ST = hostWin.SillyTavern;
+    if (!ST || typeof ST.getContext !== 'function') return;
+    const ctx = ST.getContext();
+    const chid = ctx.characterId;
+    if (chid === undefined || !ctx.characters?.[chid]) return;
+    const charObj = ctx.characters[chid];
+    const manifest = charObj?.data?.extensions?.st_capsule_manifest;
+    const encoded = charObj?.data?.extensions?.st_capsule_bundle;
+    if (!manifest || !encoded || manifest.spec !== '${BUNDLE_SPEC}') return;
+
     const headers = ctx.getRequestHeaders ? ctx.getRequestHeaders() : { 'Content-Type': 'application/json' };
+    const setResp = await hostWin.fetch('/api/settings/get', { method: 'POST', headers, body: '{}' });
+    const setJson = setResp.ok ? await setResp.json() : {};
+    const existingWorlds = new Set(setJson.world_names || []);
+    const missingBooks = (manifest.all_worldbooks || []).filter(n => !existingWorlds.has(n));
+    const pm = typeof ctx.getPresetManager === 'function' ? ctx.getPresetManager('openai') : null;
+    const hasPreset = !manifest.bound_preset?.name || Boolean(pm?.findPreset?.(manifest.bound_preset.name));
+    if (missingBooks.length === 0 && hasPreset) return;
+
+    const b64 = encoded.slice('${BUNDLE_PREFIX_MAGIC}'.length);
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    const ds = new DecompressionStream('gzip');
+    const w = ds.writable.getWriter();
+    w.write(u8); w.close();
+    const bundle = JSON.parse(new TextDecoder('utf-8').decode(await new Response(ds.readable).arrayBuffer()));
+
+    for (const wb of (bundle.worldbooks || [])) {
+      if (!wb?.name || !wb?.data) continue;
+      await hostWin.fetch('/api/worldinfo/edit', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ name: wb.name, data: wb.data }),
+      });
+    }
+    if (bundle.preset?.name && bundle.preset?.data && pm?.savePreset) {
+      await pm.savePreset(bundle.preset.name, bundle.preset.data);
+      const pv = pm.findPreset(bundle.preset.name);
+      if (pv !== undefined && pv !== null) pm.selectPreset(pv);
+    }
+    const charKey = String(charObj.avatar || '').replace(/\\.[^/.]+$/, '');
+    if (ctx.worldInfo) {
+      ctx.worldInfo.charLore = ctx.worldInfo.charLore || [];
+      const idx = ctx.worldInfo.charLore.findIndex(e => e.name === charKey);
+      const extra = manifest.extra_worldbooks || [];
+      if (idx >= 0) ctx.worldInfo.charLore[idx].extraBooks = extra;
+      else if (extra.length) ctx.worldInfo.charLore.push({ name: charKey, extraBooks: extra });
+    }
+    await ctx.saveSettings?.();
+    if (hostWin.toastr) hostWin.toastr.success('已自动部署角色内置世界书与预设，刷新页面即可完全生效');
+  } catch (e) {
+    console.warn('[ST-Capsule-Bootstrap]', e);
+  }
+})();
+`.trim();
+
+    return {
+        scripts: [
+            {
+                type: 'script',
+                enabled: true,
+                id: 'stcap_v2_self_installer',
+                name: `${prefix}单卡内置世界书与预设自动部署器`,
+                info: '当未安装 ST-Capsule-Packer v2.0 时，由酒馆助手自动解包安装本卡内置的全部世界书与专属预设。',
+                button: { enabled: false, buttons: [] },
+                data: {},
+                content: scriptCode,
+            },
+        ],
+        variables: {},
+    };
+}
+
+// ============================================================================
+// 4. SillyTavern Host Context & Module Bridge
+// ============================================================================
+function getCtx() {
+    return window.SillyTavern?.getContext?.() || {};
+}
+
+async function getHostMods() {
+    if (cachedMods) return cachedMods;
+    const safeImport = async (relPath) => {
+        try { return await import(relPath); } catch { return {}; }
+    };
+    const [scriptMod, wiMod, extMod, pmMod] = await Promise.all([
+        safeImport('../../../../script.js'),
+        safeImport('../../../world-info.js'),
+        safeImport('../../../extensions.js'),
+        safeImport('../../../preset-manager.js'),
+    ]);
+    cachedMods = { scriptMod, wiMod, extMod, pmMod };
+    return cachedMods;
+}
+
+async function apiPost(url, bodyObj) {
+    const ctx = getCtx();
+    const headers = ctx.getRequestHeaders
+        ? ctx.getRequestHeaders()
+        : (cachedMods?.scriptMod?.getRequestHeaders ? cachedMods.scriptMod.getRequestHeaders() : { 'Content-Type': 'application/json' });
     const resp = await fetch(url, {
         method: 'POST',
         headers,
-        body: JSON.stringify(body),
+        body: JSON.stringify(bodyObj ?? {}),
     });
-    if (!resp.ok) throw new Error(`${url} -> HTTP ${resp.status}`);
-    return await resp.json();
-}
-
-async function createFallbackPngBytes(label = 'ST') {
-    const canvas = document.createElement('canvas');
-    canvas.width = 512;
-    canvas.height = 768;
-    const g = canvas.getContext('2d');
-    const grad = g.createLinearGradient(0, 0, 512, 768);
-    grad.addColorStop(0, '#0f172a');
-    grad.addColorStop(1, '#1e1b4b');
-    g.fillStyle = grad;
-    g.fillRect(0, 0, 512, 768);
-    g.fillStyle = '#669df6';
-    g.font = 'bold 42px sans-serif';
-    g.textAlign = 'center';
-    g.fillText(String(label || 'ST').slice(0, 12), 256, 384);
-    const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
-    return new Uint8Array(await blob.arrayBuffer());
-}
-
-async function fetchCharacterAvatarBytes(avatar) {
-    if (avatar) {
-        try {
-            const resp = await fetch(`/characters/${encodeURIComponent(avatar)}`, { cache: 'no-store' });
-            if (resp.ok) {
-                const buf = new Uint8Array(await resp.arrayBuffer());
-                if (buf.length > 8 && buf[0] === 137 && buf[1] === 80) return buf;
-            }
-        } catch (e) {
-            console.warn('[ST-Capsule] Avatar fetch fallback:', e);
-        }
+    if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status} (${url}): ${errText}`);
     }
-    return await createFallbackPngBytes(avatar || 'Card');
-}
-
-function buildStandardV2Card(charObj) {
-    const data = safeJsonClone(charObj?.data, {});
-    data.name = data.name || charObj?.name || '';
-    data.description = data.description ?? charObj?.description ?? '';
-    data.personality = data.personality ?? charObj?.personality ?? '';
-    data.scenario = data.scenario ?? charObj?.scenario ?? '';
-    data.first_mes = data.first_mes ?? charObj?.first_mes ?? '';
-    data.mes_example = data.mes_example ?? charObj?.mes_example ?? '';
-    data.creator_notes = data.creator_notes ?? charObj?.creatorcomment ?? '';
-    data.tags = Array.isArray(data.tags) ? data.tags : (Array.isArray(charObj?.tags) ? safeJsonClone(charObj.tags, []) : []);
-    data.alternate_greetings = Array.isArray(data.alternate_greetings) ? data.alternate_greetings : [];
-    data.extensions = data.extensions || {};
-    if (charObj?.fav !== undefined) data.extensions.fav = Boolean(charObj.fav);
-    if (charObj?.talkativeness !== undefined) data.extensions.talkativeness = charObj.talkativeness;
-
-    return {
-        name: data.name,
-        description: data.description,
-        personality: data.personality,
-        scenario: data.scenario,
-        first_mes: data.first_mes,
-        mes_example: data.mes_example,
-        creatorcomment: data.creator_notes || '',
-        avatar: 'none',
-        chat: charObj?.chat || '',
-        talkativeness: String(charObj?.talkativeness ?? '0.5'),
-        fav: Boolean(charObj?.fav),
-        tags: data.tags,
-        spec: 'chara_card_v2',
-        spec_version: '2.0',
-        data,
-    };
-}
-
-function normalizeChatMessagesResponse(resp) {
-    if (Array.isArray(resp)) return resp;
-    if (resp && Array.isArray(resp.chat)) return resp.chat;
-    if (resp && Array.isArray(resp.messages)) return resp.messages;
-    return null;
-}
-
-async function inspectCharacterWorkspace(chid) {
-    const ctx = getCtx();
-    const { extMod, pmMod, puMod, wiMod, openaiMod } = await getHostMods();
-    const extension_settings = extMod.extension_settings || ctx.extensionSettings || {};
-    const power_user = puMod.power_user || ctx.powerUserSettings || {};
-    const world_info = wiMod.world_info || {};
-    const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
-
-    const characters = ctx.characters || [];
-    if (chid === undefined || chid === null || !characters[chid]) {
-        return null;
-    }
-    if (typeof ctx.unshallowCharacter === 'function') {
-        try { await ctx.unshallowCharacter(chid); } catch (e) { console.warn('[ST-Capsule] unshallow warning:', e); }
-    }
-    const charObj = characters[chid];
-    const avatar = charObj.avatar || '';
-    const charKey = String(avatar).replace(/\.png$/i, '');
-
-    // 1. Worldbooks discovery (Supports both Luker & Vanilla SillyTavern)
-    let allWorldList = [];
-    try {
-        const wiResp = await apiPost('/api/worldinfo/list', {});
-        if (Array.isArray(wiResp)) {
-            allWorldList = wiResp.map(w => (typeof w === 'string' ? w : (w?.file_id || w?.name))).filter(Boolean);
-        }
-    } catch {
-        if (Array.isArray(wiMod.world_names)) allWorldList = [...wiMod.world_names];
-    }
-
-    const roleMap = new Map();
-    const addBookRole = (bookName, role) => {
-        if (!bookName || typeof bookName !== 'string') return;
-        if (!roleMap.has(bookName)) roleMap.set(bookName, new Set());
-        roleMap.get(bookName).add(role);
-    };
-
-    const primaryBook = charObj?.data?.extensions?.world || charObj?.world || null;
-    if (primaryBook) addBookRole(primaryBook, '角色主世界书');
-
-    // Luker getCharaAuxWorlds support
-    if (typeof wiMod.getCharaAuxWorlds === 'function') {
-        try {
-            const aux = wiMod.getCharaAuxWorlds(avatar) || wiMod.getCharaAuxWorlds(charKey) || [];
-            if (Array.isArray(aux)) aux.forEach(b => addBookRole(b, '角色附加世界书'));
-        } catch {}
-    }
-
-    const charLoreArr = world_info?.charLore || [];
-    const extraEntry = Array.isArray(charLoreArr) ? charLoreArr.find(e => e.name === charKey || e.name === avatar) : null;
-    if (Array.isArray(extraEntry?.extraBooks)) {
-        extraEntry.extraBooks.forEach(b => addBookRole(b, '角色附加世界书'));
-    }
-
-    const globalBooks = world_info?.globalSelect || wiMod.selected_world_info || [];
-    if (Array.isArray(globalBooks)) {
-        globalBooks.forEach(b => addBookRole(b, '全局启用世界书'));
-    }
-
-    // Luker getChatWorldInfoNames support
-    if (ctx.characterId == chid && typeof wiMod.getChatWorldInfoNames === 'function') {
-        try {
-            const cw = wiMod.getChatWorldInfoNames();
-            if (Array.isArray(cw)) cw.forEach(b => addBookRole(b, '当前聊天绑定'));
-        } catch {}
-    }
-
-    const wiLocks = extension_settings?.worldInfoPresets;
-    const lockedPresetName = wiLocks?.characterLocks?.[avatar] || wiLocks?.characterLocks?.[charKey];
-    if (lockedPresetName && Array.isArray(wiLocks?.presetList)) {
-        const foundPreset = wiLocks.presetList.find(p => p.name === lockedPresetName);
-        if (Array.isArray(foundPreset?.worldList)) {
-            foundPreset.worldList.forEach(b => addBookRole(b, 'WorldInfoLocks绑定'));
-        }
-    }
-
-    const userAvatar = power_user?.personas ? Object.keys(power_user.personas).find(k => power_user.personas[k] === ctx.name1) : null;
-    const personaBook = userAvatar ? power_user?.persona_descriptions?.[userAvatar]?.lorebook : null;
-    if (personaBook) addBookRole(personaBook, '当前人设世界书');
-
-    // 2. Chats discovery
-    let chatFiles = [];
-    try {
-        const chatsResp = await apiPost('/api/characters/chats', { avatar_url: avatar });
-        if (Array.isArray(chatsResp)) {
-            chatFiles = chatsResp.map(c => {
-                const fileName = c.file_name || '';
-                const fileId = c.file_id || fileName.replace(/\.jsonl$/i, '');
-                if (c.chat_metadata?.world_info) {
-                    addBookRole(c.chat_metadata.world_info, '聊天分支绑定');
-                }
-                return {
-                    file_name: fileName.endsWith('.jsonl') ? fileName : `${fileName}.jsonl`,
-                    file_id: fileId,
-                    message_count: c.chat_items ?? c.message_count ?? 0,
-                    file_size: c.file_size || '',
-                    last_mes: c.last_mes || '',
-                    is_active: fileId === charObj.chat,
-                };
-            }).filter(c => c.file_id);
-        }
-    } catch (e) {
-        console.warn('[ST-Capsule] characters/chats warning:', e);
-    }
-
-    if (ctx.characterId == chid && ctx.chatMetadata?.world_info) {
-        addBookRole(ctx.chatMetadata.world_info, '当前聊天绑定');
-    }
-
-    const worldbookOptions = [];
-    for (const [name, roles] of roleMap.entries()) {
-        worldbookOptions.push({ name, roles: [...roles], preselected: true });
-    }
-    for (const name of allWorldList) {
-        if (!roleMap.has(name)) {
-            worldbookOptions.push({ name, roles: [], preselected: false });
-        }
-    }
-
-    // 3. Presets discovery (Luker + Vanilla ST safe)
-    const pm = typeof getPresetManager === 'function' ? getPresetManager() : null;
-    let activePresetName = '';
-    let presetNames = [];
-    try {
-        if (pm) {
-            activePresetName = pm.getSelectedPresetName?.() || '';
-            const allPresets = pm.getPresetList?.();
-            if (allPresets?.preset_names) {
-                presetNames = Array.isArray(allPresets.preset_names)
-                    ? [...allPresets.preset_names]
-                    : Object.keys(allPresets.preset_names);
-            }
-        }
-    } catch (e) {
-        console.warn('[ST-Capsule] Preset list warning:', e);
-    }
-    if (!activePresetName && openaiMod?.oai_settings?.preset_settings_openai) {
-        activePresetName = String(openaiMod.oai_settings.preset_settings_openai);
-    }
-    if (activePresetName && !presetNames.includes(activePresetName)) {
-        presetNames.unshift(activePresetName);
-    }
-
-    // 4. Regex & TavernHelper discovery
-    const globalRegex = Array.isArray(extension_settings?.regex) ? extension_settings.regex : [];
-    const scopedRegex = Array.isArray(charObj?.data?.extensions?.regex_scripts) ? charObj.data.extensions.regex_scripts : [];
-    let presetRegex = [];
-    try {
-        const activePresetData = pm?.getPresetSettings?.(activePresetName) || openaiMod?.oai_settings;
-        if (Array.isArray(activePresetData?.extensions?.regex_scripts)) {
-            presetRegex = activePresetData.extensions.regex_scripts;
-        }
-    } catch {}
-
-    const thGlobalScripts = extension_settings?.tavern_helper?.script?.scripts || [];
-    const thCharScripts = charObj?.data?.extensions?.TavernHelper_scripts || [];
-
-    return {
-        chid,
-        charObj,
-        avatar,
-        charKey,
-        name: charObj.name || charKey || 'Character',
-        worldbookOptions,
-        chatFiles,
-        activePresetName,
-        presetNames,
-        globalRegex,
-        scopedRegex,
-        presetRegex,
-        thGlobalScripts: Array.isArray(thGlobalScripts) ? thGlobalScripts : Object.values(thGlobalScripts || {}),
-        thCharScripts: Array.isArray(thCharScripts) ? thCharScripts : Object.values(thCharScripts || {}),
-    };
+    const ct = resp.headers.get('content-type') || '';
+    if (ct.includes('application/json')) return await resp.json();
+    return await resp.text();
 }
 
 function escapeHtml(str) {
@@ -627,31 +853,452 @@ function isLukerAndroidApp() {
     );
 }
 
-function canShareFileMobile() {
+// ============================================================================
+// 5. Core Lifecycle Engine: Auto-Unpack, Auto-Preset-Switch & Cascade Delete
+// ============================================================================
+function suppressEnablementPopupsForCard(charObj, presetName, extSettings) {
     try {
-        if (typeof navigator !== 'undefined' && navigator.canShare && typeof File !== 'undefined') {
-            const testFile = new File(['1'], 't.png', { type: 'image/png' });
-            return navigator.canShare({ files: [testFile] });
+        const avatar = charObj?.avatar;
+        const charName = charObj?.name;
+        if (avatar) {
+            localStorage.setItem(`AlertWI_${avatar}`, 'true');
+            localStorage.setItem(`AlertRegex_${avatar}`, 'true');
+            if (!Array.isArray(extSettings.character_allowed_regex)) {
+                extSettings.character_allowed_regex = [];
+            }
+            if (!extSettings.character_allowed_regex.includes(avatar)) {
+                extSettings.character_allowed_regex.push(avatar);
+            }
+        }
+        if (presetName) {
+            localStorage.setItem(`AlertRegex_openai_${presetName}`, 'true');
+            if (!extSettings.preset_allowed_regex || typeof extSettings.preset_allowed_regex !== 'object') {
+                extSettings.preset_allowed_regex = {};
+            }
+            if (!Array.isArray(extSettings.preset_allowed_regex.openai)) {
+                extSettings.preset_allowed_regex.openai = [];
+            }
+            if (!extSettings.preset_allowed_regex.openai.includes(presetName)) {
+                extSettings.preset_allowed_regex.openai.push(presetName);
+            }
+        }
+        if (charName && extSettings?.tavern_helper?.script?.popuped?.characters) {
+            const pList = extSettings.tavern_helper.script.popuped.characters;
+            if (Array.isArray(pList) && !pList.includes(charName)) pList.push(charName);
         }
     } catch {}
+}
+
+function switchPresetCleanly(pm, targetPresetName) {
+    if (!pm || !targetPresetName) return false;
+    const currentName = pm.getSelectedPresetName?.() || '';
+    if (currentName === targetPresetName) return true;
+    const optionVal = pm.findPreset?.(targetPresetName);
+    if (optionVal !== undefined && optionVal !== null && optionVal !== '') {
+        pm.selectPreset(optionVal);
+        return true;
+    }
     return false;
 }
 
+async function ensureCardBundleInstalled(chid, { forceReinstall = false, switchPreset = true } = {}) {
+    const ctx = getCtx();
+    const characters = ctx.characters || [];
+    const charObj = characters[chid];
+    if (!charObj) return false;
+
+    const manifest = charObj?.data?.extensions?.st_capsule_manifest;
+    const encodedBundle = charObj?.data?.extensions?.st_capsule_bundle;
+    if (!manifest || !encodedBundle || manifest.spec !== BUNDLE_SPEC) return false;
+
+    const avatar = charObj.avatar;
+    if (!avatar || installingAvatars.has(avatar)) return false;
+
+    const { wiMod, extMod, pmMod, scriptMod } = await getHostMods();
+    const extension_settings = extMod.extension_settings || ctx.extensionSettings || {};
+    const world_info = wiMod.world_info || {};
+    const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
+    const pm = typeof getPresetManager === 'function' ? getPresetManager('openai') : null;
+
+    const charKey = getCharKeyWithoutExt(avatar);
+    const sig = `${manifest.bundle_id || manifest.prefix}:${(manifest.all_worldbooks || []).length}:${manifest.bound_preset?.name || ''}`;
+
+    // Fast check if already verified in this browser session and bindings intact
+    if (!forceReinstall && installedSessionSignatures.get(avatar) === sig) {
+        if (switchPreset && manifest.bound_preset?.name && pm) {
+            const curPreset = pm.getSelectedPresetName?.() || '';
+            if (curPreset && !extractLeadingPrefix(curPreset) && !extractTrailingTag(curPreset)) {
+                localStorage.setItem(LS_LAST_NORMAL_PRESET, curPreset);
+            }
+            switchPresetCleanly(pm, manifest.bound_preset.name);
+        }
+        return true;
+    }
+
+    // Check actual server world_names + charLore + preset presence
+    let existingWorldSet = new Set(Array.isArray(wiMod.world_names) ? wiMod.world_names : []);
+    if (existingWorldSet.size === 0 || forceReinstall) {
+        try {
+            const setJson = await apiPost('/api/settings/get', {});
+            existingWorldSet = new Set(setJson.world_names || []);
+        } catch {}
+    }
+
+    const expectedAllBooks = Array.isArray(manifest.all_worldbooks) ? manifest.all_worldbooks : [];
+    const expectedExtraBooks = Array.isArray(manifest.extra_worldbooks) ? manifest.extra_worldbooks : [];
+    const missingBooks = expectedAllBooks.filter(b => !existingWorldSet.has(b));
+
+    const charLoreArr = world_info.charLore || [];
+    const loreEntry = charLoreArr.find(e => e.name === charKey);
+    const currentExtraSet = new Set(loreEntry?.extraBooks || []);
+    const bindingComplete = expectedExtraBooks.every(b => currentExtraSet.has(b)) &&
+        (!manifest.primary_worldbook || charObj?.data?.extensions?.world === manifest.primary_worldbook);
+
+    const boundPresetName = manifest.bound_preset?.name || '';
+    const hasBoundPreset = !boundPresetName || Boolean(pm?.findPreset?.(boundPresetName));
+
+    suppressEnablementPopupsForCard(charObj, boundPresetName, extension_settings);
+
+    if (!forceReinstall && missingBooks.length === 0 && bindingComplete && hasBoundPreset) {
+        installedSessionSignatures.set(avatar, sig);
+        if (switchPreset && boundPresetName && pm) {
+            const curPreset = pm.getSelectedPresetName?.() || '';
+            if (curPreset && !extractLeadingPrefix(curPreset) && !extractTrailingTag(curPreset)) {
+                localStorage.setItem(LS_LAST_NORMAL_PRESET, curPreset);
+            }
+            if (curPreset !== boundPresetName && switchPresetCleanly(pm, boundPresetName)) {
+                if (window.toastr) window.toastr.info(`已自动切换专属预设：${boundPresetName}`, '角色绑定预设');
+            }
+        }
+        return true;
+    }
+
+    // Need to unpack & install!
+    installingAvatars.add(avatar);
+    try {
+        if (window.toastr) {
+            window.toastr.info(
+                `正在自动展开 ${manifest.prefix || ''} 内置的 ${expectedAllBooks.length} 本世界书与专属预设...`,
+                '单卡全内置自动部署',
+                { timeOut: 4000 },
+            );
+        }
+
+        const bundle = await decodeBundlePayload(encodedBundle);
+
+        // 1. Write all worldbooks (only missing ones unless forceReinstall)
+        const booksToWrite = (bundle.worldbooks || []).filter(wb => wb?.name && wb?.data && (forceReinstall || !existingWorldSet.has(wb.name)));
+        for (const wb of booksToWrite) {
+            const payload = JSON.parse(JSON.stringify(wb.data));
+            payload.name = wb.name;
+            await apiPost('/api/worldinfo/edit', { name: wb.name, data: payload });
+        }
+
+        // 2. CRITICAL: Refresh SillyTavern's in-memory world_names & dropdowns!
+        if (typeof wiMod.updateWorldInfoList === 'function') {
+            await wiMod.updateWorldInfoList();
+        }
+
+        // 3. Bind primary worldbook on character if needed
+        if (manifest.primary_worldbook && charObj?.data?.extensions?.world !== manifest.primary_worldbook) {
+            charObj.data = charObj.data || {};
+            charObj.data.extensions = charObj.data.extensions || {};
+            charObj.data.extensions.world = manifest.primary_worldbook;
+            await apiPost('/api/characters/merge-attributes', {
+                avatar: charObj.avatar,
+                data: { extensions: { world: manifest.primary_worldbook } },
+            }).catch(() => {});
+        }
+
+        // 4. CRITICAL: Bind extraBooks using exact stripped charKey (WITHOUT .png!)
+        if (typeof wiMod.charSetAuxWorlds === 'function') {
+            try { wiMod.charSetAuxWorlds(charKey, expectedExtraBooks); } catch {}
+        }
+        world_info.charLore = world_info.charLore || [];
+        // Remove any accidental .png-suffixed stale entry
+        const stalePngIdx = world_info.charLore.findIndex(e => e.name === avatar);
+        if (stalePngIdx >= 0 && avatar !== charKey) {
+            world_info.charLore.splice(stalePngIdx, 1);
+        }
+        const cleanIdx = world_info.charLore.findIndex(e => e.name === charKey);
+        if (expectedExtraBooks.length > 0) {
+            if (cleanIdx >= 0) {
+                world_info.charLore[cleanIdx].extraBooks = [...new Set(expectedExtraBooks)];
+            } else {
+                world_info.charLore.push({ name: charKey, extraBooks: [...new Set(expectedExtraBooks)] });
+            }
+        }
+
+        // 5. Install & select bound OpenAI preset
+        if (bundle.preset?.name && bundle.preset?.data && pm?.savePreset) {
+            const curPreset = pm.getSelectedPresetName?.() || '';
+            if (curPreset && !extractLeadingPrefix(curPreset) && !extractTrailingTag(curPreset)) {
+                localStorage.setItem(LS_LAST_NORMAL_PRESET, curPreset);
+            }
+            const pCopy = JSON.parse(JSON.stringify(bundle.preset.data));
+            pCopy.name = bundle.preset.name;
+            await pm.savePreset(bundle.preset.name, pCopy);
+            suppressEnablementPopupsForCard(charObj, bundle.preset.name, extension_settings);
+            if (switchPreset) {
+                switchPresetCleanly(pm, bundle.preset.name);
+            }
+        }
+
+        // 6. Optional chats inside bundle (only if bundle explicitly carries chats)
+        if (Array.isArray(bundle.chats) && bundle.chats.length > 0) {
+            let existingChatIds = new Set();
+            try {
+                const existResp = await apiPost('/api/characters/chats', { avatar_url: avatar, simple: true });
+                if (Array.isArray(existResp)) {
+                    existingChatIds = new Set(existResp.map(c => c.file_id || String(c.file_name || '').replace(/\.jsonl$/i, '')));
+                }
+            } catch {}
+            for (const ch of bundle.chats) {
+                if (!ch?.file_id || !Array.isArray(ch.messages) || existingChatIds.has(ch.file_id)) continue;
+                await apiPost('/api/chats/save', {
+                    ch_name: charObj.name,
+                    file_name: ch.file_id,
+                    chat: ch.messages,
+                    avatar_url: avatar,
+                    force: true,
+                });
+            }
+        }
+
+        // 7. Immediate saveSettings + update globe indicator
+        if (typeof scriptMod.saveSettings === 'function') {
+            await scriptMod.saveSettings();
+        } else {
+            ctx.saveSettingsDebounced?.();
+        }
+        if (typeof wiMod.setWorldInfoButtonClass === 'function') {
+            try { wiMod.setWorldInfoButtonClass(chid); } catch {}
+        }
+
+        installedSessionSignatures.set(avatar, sig);
+        if (window.toastr) {
+            window.toastr.success(
+                `已自动挂接 ${expectedAllBooks.length} 本 ${manifest.prefix || ''} 世界书并激活专属预设`,
+                '单卡全内置部署完成',
+            );
+        }
+        return true;
+    } catch (err) {
+        console.error('[ST-Capsule v2] Auto-install error:', err);
+        if (window.toastr) window.toastr.error(`自动部署内置资产出错：${err?.message || err}`);
+        return false;
+    } finally {
+        installingAvatars.delete(avatar);
+    }
+}
+
+async function handleChatChangedAutoHooks() {
+    try {
+        const ctx = getCtx();
+        const chid = ctx.characterId;
+        const { pmMod } = await getHostMods();
+        const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
+        const pm = typeof getPresetManager === 'function' ? getPresetManager('openai') : null;
+
+        if (chid === undefined || chid === null || !ctx.characters?.[chid]) return;
+        const charObj = ctx.characters[chid];
+        const manifest = charObj?.data?.extensions?.st_capsule_manifest;
+
+        if (manifest && manifest.spec === BUNDLE_SPEC) {
+            await ensureCardBundleInstalled(chid, { switchPreset: true });
+        } else if (pm) {
+            // Switched to a normal non-bundle character: if currently sitting on a 【...】 bound preset, restore normal preset!
+            const curPreset = pm.getSelectedPresetName?.() || '';
+            const curPfx = extractLeadingPrefix(curPreset);
+            const lastNormal = localStorage.getItem(LS_LAST_NORMAL_PRESET) || '';
+            if (curPfx && lastNormal && lastNormal !== curPreset) {
+                if (switchPresetCleanly(pm, lastNormal)) {
+                    if (window.toastr) window.toastr.info(`已切回常规预设：${lastNormal}`, '预设自动还原');
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('[ST-Capsule v2] CHAT_CHANGED hook warning:', err);
+    }
+}
+
+async function deleteBundleAssetsByPrefixOrManifest({ prefix, worldbookNames = [], presetName = '', deletedAvatar = '' }) {
+    const ctx = getCtx();
+    const { wiMod, pmMod, scriptMod, extMod } = await getHostMods();
+    const world_info = wiMod.world_info || {};
+    const extension_settings = extMod.extension_settings || ctx.extensionSettings || {};
+    const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
+    const pm = typeof getPresetManager === 'function' ? getPresetManager('openai') : null;
+
+    // Safety check: ensure no OTHER remaining character card uses the exact same prefix
+    const remainingChars = (ctx.characters || []).filter(c => c && c.avatar !== deletedAvatar);
+    if (prefix) {
+        const stillUsed = remainingChars.some(c =>
+            c?.data?.extensions?.st_capsule_manifest?.prefix === prefix ||
+            String(c?.name || '').startsWith(prefix)
+        );
+        if (stillUsed) {
+            console.info(`[ST-Capsule v2] Prefix ${prefix} is still used by another character; skipping shared deletion.`);
+            return { deletedBooks: 0, deletedPresets: 0, skippedShared: true };
+        }
+    }
+
+    // Gather all current world_names from server
+    let serverWorlds = [];
+    try {
+        const setJson = await apiPost('/api/settings/get', {});
+        serverWorlds = setJson.world_names || [];
+    } catch {
+        serverWorlds = Array.isArray(wiMod.world_names) ? [...wiMod.world_names] : [];
+    }
+
+    const booksToDelete = new Set(worldbookNames.filter(Boolean));
+    if (prefix) {
+        for (const w of serverWorlds) {
+            if (w.startsWith(prefix) || w.endsWith(prefix)) booksToDelete.add(w);
+        }
+    }
+
+    const serverWorldSet = new Set(serverWorlds);
+    let deletedBooks = 0;
+    for (const wbName of booksToDelete) {
+        if (!serverWorldSet.has(wbName)) continue;
+        try {
+            await apiPost('/api/worldinfo/delete', { name: wbName });
+            deletedBooks++;
+        } catch (err) {
+            console.warn(`[ST-Capsule v2] Failed to delete worldbook ${wbName}:`, err);
+        }
+    }
+
+    // Clean charLore references
+    if (Array.isArray(world_info.charLore)) {
+        const deletedKey = getCharKeyWithoutExt(deletedAvatar);
+        world_info.charLore = world_info.charLore
+            .filter(entry => !deletedKey || (entry.name !== deletedKey && entry.name !== deletedAvatar))
+            .map(entry => ({
+                ...entry,
+                extraBooks: (entry.extraBooks || []).filter(b => !booksToDelete.has(b)),
+            }))
+            .filter(entry => Array.isArray(entry.extraBooks) && entry.extraBooks.length > 0);
+    }
+
+    // Also remove from global selected_world_info if present
+    if (Array.isArray(wiMod.selected_world_info)) {
+        for (let i = wiMod.selected_world_info.length - 1; i >= 0; i--) {
+            if (booksToDelete.has(wiMod.selected_world_info[i])) {
+                wiMod.selected_world_info.splice(i, 1);
+            }
+        }
+    }
+
+    if (typeof wiMod.updateWorldInfoList === 'function') {
+        await wiMod.updateWorldInfoList();
+    }
+
+    // Delete bound / prefixed OpenAI presets
+    const presetsToDelete = new Set();
+    if (presetName) presetsToDelete.add(presetName);
+    if (prefix && pm?.getAllPresets) {
+        for (const pName of (pm.getAllPresets() || [])) {
+            if (pName.startsWith(prefix) || pName.endsWith(prefix)) presetsToDelete.add(pName);
+        }
+    }
+
+    let deletedPresets = 0;
+    for (const pName of presetsToDelete) {
+        try {
+            if (pm) {
+                const curSelected = pm.getSelectedPresetName?.() || '';
+                if (curSelected === pName) {
+                    const fallback = localStorage.getItem(LS_LAST_NORMAL_PRESET) ||
+                        (pm.getAllPresets?.() || []).find(x => !presetsToDelete.has(x)) || '';
+                    if (fallback) switchPresetCleanly(pm, fallback);
+                }
+            }
+            await apiPost('/api/presets/delete', { name: pName, apiId: 'openai' });
+            if (extension_settings?.preset_allowed_regex?.openai) {
+                extension_settings.preset_allowed_regex.openai =
+                    extension_settings.preset_allowed_regex.openai.filter(x => x !== pName);
+            }
+            localStorage.removeItem(`AlertRegex_openai_${pName}`);
+            deletedPresets++;
+        } catch (err) {
+            console.warn(`[ST-Capsule v2] Preset delete warning (${pName}):`, err);
+        }
+    }
+
+    // Reload preset dropdown list cleanly
+    if (deletedPresets > 0) {
+        try {
+            const setJson = await apiPost('/api/settings/get', {});
+            if (pm && setJson.openai_setting_names && pm.presetNames) {
+                // Trigger ST settings sync if available
+            }
+        } catch {}
+    }
+
+    if (deletedAvatar) {
+        installedSessionSignatures.delete(deletedAvatar);
+    }
+
+    if (typeof scriptMod.saveSettings === 'function') {
+        await scriptMod.saveSettings();
+    } else {
+        ctx.saveSettingsDebounced?.();
+    }
+
+    return { deletedBooks, deletedPresets, skippedShared: false };
+}
+
+async function handleCharacterDeletedEvent(payload) {
+    try {
+        const character = payload?.character;
+        if (!character) return;
+        const avatar = character.avatar || '';
+        const manifest = character?.data?.extensions?.st_capsule_manifest;
+        const leadingPfx = manifest?.prefix || extractLeadingPrefix(character.name || '');
+
+        if (!manifest && !leadingPfx) return;
+
+        const wbList = manifest?.all_worldbooks || [];
+        const boundPreset = manifest?.bound_preset?.name || '';
+
+        const res = await deleteBundleAssetsByPrefixOrManifest({
+            prefix: leadingPfx,
+            worldbookNames: wbList,
+            presetName: boundPreset,
+            deletedAvatar: avatar,
+        });
+
+        if (!res.skippedShared && (res.deletedBooks > 0 || res.deletedPresets > 0)) {
+            if (window.toastr) {
+                window.toastr.success(
+                    `已随角色卡一并删除 ${res.deletedBooks} 本世界书与 ${res.deletedPresets} 套专属预设 (${leadingPfx || '绑定包'})`,
+                    '全家桶级联清理完成',
+                );
+            }
+        }
+    } catch (err) {
+        console.error('[ST-Capsule v2] CHARACTER_DELETED cascade error:', err);
+    }
+}
+
+// ============================================================================
+// 6. File Saving Bridge (Luker Android SAF Stream + Browser Download)
+// ============================================================================
 async function stageFileOnLocalServer(uint8Bytes, extSuffix) {
     try {
         const asciiTempName = `stcap_${Date.now()}${extSuffix}`;
         const b64 = uint8ToBase64(uint8Bytes);
-        const resp = await apiPost('/api/files/upload', {
-            name: asciiTempName,
-            data: b64,
-        });
+        const resp = await apiPost('/api/files/upload', { name: asciiTempName, data: b64 });
         if (resp?.path) {
             const relPath = resp.path.startsWith('/') ? resp.path : `/${resp.path}`;
             const fullUrl = new URL(relPath, window.location.origin).href;
             return { ok: true, relPath, fullUrl, asciiTempName };
         }
     } catch (err) {
-        console.warn('[ST-Capsule] /api/files/upload staging warning:', err);
+        console.warn('[ST-Capsule v2] /api/files/upload staging warning:', err);
     }
     return { ok: false, relPath: '', fullUrl: '', asciiTempName: '' };
 }
@@ -666,29 +1313,11 @@ function triggerHttpAnchorDownload(httpUrl, filename) {
     setTimeout(() => a.remove(), 3000);
 }
 
-async function saveGeneratedPayload({ bytes, filename, mimeType, extSuffix, useMobileShare = false }) {
+async function saveGeneratedPayload({ bytes, filename, mimeType, extSuffix }) {
     const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
     const blob = new Blob([u8], { type: mimeType });
-
-    // Always stage onto SillyTavern/Luker's /user/files/ first so there is zero JNI size limit
     const staged = await stageFileOnLocalServer(u8, extSuffix);
 
-    // 1. Explicit Web Share sheet if user clicked Share button
-    if (useMobileShare && navigator.share && typeof File !== 'undefined') {
-        try {
-            const fileObj = new File([blob], filename, { type: mimeType });
-            if (!navigator.canShare || navigator.canShare({ files: [fileObj] })) {
-                await navigator.share({ title: filename, files: [fileObj] });
-                return { via: 'share', blob, staged };
-            }
-        } catch (err) {
-            if (err?.name === 'AbortError') return { via: 'cancelled', blob, staged };
-            console.warn('[ST-Capsule] Share fallback:', err);
-        }
-    }
-
-    // 2. Preferred Luker Android Stream Bridge (MainActivity.kt -> saveFileFromUrl -> launchSafPickerFor)
-    // Passes only a tiny JSON string across JNI, avoiding WebView @JavascriptInterface multi-MB dataUrl drops!
     if (staged.ok && window.LukerAndroid && typeof window.LukerAndroid.saveFileFromUrl === 'function') {
         try {
             const ctx = getCtx();
@@ -700,52 +1329,105 @@ async function saveGeneratedPayload({ bytes, filename, mimeType, extSuffix, useM
                 method: 'GET',
                 headers: reqHeaders,
             }));
-            return { via: 'luker-stream-saf', blob, staged };
+            return { via: 'luker-stream-saf', staged };
         } catch (err) {
-            console.warn('[ST-Capsule] saveFileFromUrl fallback:', err);
+            console.warn('[ST-Capsule v2] saveFileFromUrl fallback:', err);
         }
     }
 
-    // 3. Older Luker Android APK: if file <= 1.2 MB use saveFileFromDataUrl; if larger, use real HTTP URL to hit WebView DownloadListener!
-    if (window.LukerAndroid && typeof window.LukerAndroid.saveFileFromDataUrl === 'function') {
-        if (u8.byteLength <= 1_200_000) {
-            try {
-                const dataUrl = `data:${mimeType};base64,${uint8ToBase64(u8)}`;
-                window.LukerAndroid.saveFileFromDataUrl(dataUrl, filename, mimeType);
-                return { via: 'luker-dataurl-saf', blob, staged };
-            } catch (err) {
-                console.warn('[ST-Capsule] saveFileFromDataUrl fallback:', err);
-            }
-        }
-        if (staged.ok) {
-            triggerHttpAnchorDownload(staged.fullUrl, filename);
-            return { via: 'luker-http-download', blob, staged };
-        }
-    }
-
-    // 4. Standard Browser Download (prefer real staged HTTP URL if available, else Blob URL)
     if (staged.ok) {
         triggerHttpAnchorDownload(staged.fullUrl, filename);
-        return { via: 'http-download', blob, staged };
+        return { via: 'http-download', staged };
     }
 
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => {
-        a.remove();
-        URL.revokeObjectURL(url);
-    }, 15000);
-    return { via: 'blob-download', blob, staged };
+    triggerHttpAnchorDownload(url, filename);
+    setTimeout(() => URL.revokeObjectURL(url), 15000);
+    return { via: 'blob-download', staged };
 }
 
 // ============================================================================
-// Top-Layer <dialog> Modal UI (Guaranteed Visible Above All Luker Layers)
+// 7. Workspace Modal UI (Export All-in-One Card / Import Card / Clean Orphans)
 // ============================================================================
-function createTopLayerModalShell(initialTab) {
+async function inspectCurrentCharacterForExport() {
+    const ctx = getCtx();
+    const { wiMod, extMod, pmMod } = await getHostMods();
+
+    const chid = ctx.characterId;
+    const characters = ctx.characters || [];
+    if (chid === undefined || chid === null || !characters[chid]) return null;
+
+    const charObj = characters[chid];
+    const avatar = charObj.avatar;
+    const charKey = getCharKeyWithoutExt(avatar);
+
+    const world_info = wiMod.world_info || {};
+    const selected_world_info = wiMod.selected_world_info || world_info.globalSelect || [];
+    let allWorldNames = Array.isArray(wiMod.world_names) && wiMod.world_names.length ? [...wiMod.world_names] : [];
+    if (!allWorldNames.length) {
+        try {
+            const s = await apiPost('/api/settings/get', {});
+            allWorldNames = s.world_names || [];
+        } catch {}
+    }
+
+    const primaryWb = charObj?.data?.extensions?.world || '';
+    const charLoreEntry = Array.isArray(world_info.charLore)
+        ? world_info.charLore.find(e => e.name === charKey || e.name === avatar)
+        : null;
+    const extraWbs = Array.isArray(charLoreEntry?.extraBooks) ? [...charLoreEntry.extraBooks] : [];
+    const boundSet = new Set([primaryWb, ...extraWbs].filter(Boolean));
+
+    const worldbookOptions = allWorldNames.map(name => ({
+        name,
+        isPrimary: name === primaryWb,
+        isExtra: extraWbs.includes(name),
+        isGlobal: selected_world_info.includes(name),
+        defaultChecked: boundSet.has(name),
+    })).sort((a, b) => (Number(b.defaultChecked) - Number(a.defaultChecked)) || a.name.localeCompare(b.name, 'zh-CN'));
+
+    let chatFiles = [];
+    try {
+        const rawChats = await apiPost('/api/characters/chats', { avatar_url: avatar, simple: true });
+        if (Array.isArray(rawChats)) {
+            chatFiles = rawChats.map(c => {
+                const fileName = c.file_name || c.file_id || '';
+                const fileId = String(fileName).replace(/\.jsonl$/i, '');
+                return { fileName, fileId, messageCount: c.chat_items ?? c.mes_count ?? '?' };
+            }).filter(c => c.fileId);
+        }
+    } catch {}
+
+    const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
+    const pm = typeof getPresetManager === 'function' ? getPresetManager('openai') : null;
+    const activePresetName = pm?.getSelectedPresetName?.() || '';
+    const presetNames = pm?.getAllPresets?.() || (activePresetName ? [activePresetName] : []);
+
+    const extension_settings = extMod.extension_settings || ctx.extensionSettings || {};
+    const scopedRegex = Array.isArray(charObj?.data?.extensions?.regex_scripts) ? charObj.data.extensions.regex_scripts : [];
+    const activePresetData = pm?.getCompletionPresetByName?.(activePresetName) || pm?.getPresetSettings?.(activePresetName);
+    const presetRegex = Array.isArray(activePresetData?.extensions?.regex_scripts) ? activePresetData.extensions.regex_scripts : [];
+
+    return {
+        chid,
+        charObj,
+        avatar,
+        charKey,
+        rawName: charObj.name || charKey || 'Character',
+        cleanBaseName: stripAnyBundleAffixes(charObj.name || charKey || 'Character'),
+        worldbookOptions,
+        boundCount: boundSet.size,
+        chatFiles,
+        pm,
+        activePresetName,
+        presetNames,
+        scopedRegex,
+        presetRegex,
+        extension_settings,
+    };
+}
+
+function createModalShell(initialTab = 'export') {
     document.querySelectorAll('.stcap-dialog, .stcap-overlay-fallback').forEach(el => {
         try { if (typeof el.close === 'function' && el.open) el.close(); } catch {}
         el.remove();
@@ -759,969 +1441,552 @@ function createTopLayerModalShell(initialTab) {
         <div class="stcap-hazard-bar"></div>
         <div class="stcap-header">
           <div class="stcap-title-wrap">
-            <span class="stcap-title">📦 酒馆全量胶囊工作台</span>
-            <span class="stcap-neon-tag">${isLukerAndroidApp() ? 'Luker Android 直连' : 'ST-CAPSULE v1.2'}</span>
+            <span class="stcap-title">📦 全内置角色卡工作台 v2.0</span>
+            <span class="stcap-neon-tag">${isLukerAndroidApp() ? 'Luker Android 直连' : '单卡多世界书+预设+级联删除'}</span>
           </div>
           <button type="button" class="stcap-close" title="关闭">✕</button>
         </div>
         <div class="stcap-tabs">
-          <button type="button" class="stcap-tab ${initialTab === 'export' ? 'active' : ''}" data-tab="export">📤 绑定打包导出</button>
-          <button type="button" class="stcap-tab ${initialTab === 'import' ? 'active' : ''}" data-tab="import">📥 读取 / 还原胶囊</button>
+          <button type="button" class="stcap-tab ${initialTab === 'export' ? 'active' : ''}" data-tab="export">📤 打包单卡导出</button>
+          <button type="button" class="stcap-tab ${initialTab === 'import' ? 'active' : ''}" data-tab="import">📥 导入单卡 / 胶囊</button>
+          <button type="button" class="stcap-tab ${initialTab === 'clean' ? 'active' : ''}" data-tab="clean">🧹 前缀批次清理</button>
         </div>
-        <div class="stcap-body" id="stcap-body">
-          <div style="padding:24px;text-align:center;color:#8ab4f8;">正在打开胶囊工作台...</div>
-        </div>
+        <div class="stcap-body" id="stcap-body"></div>
         <div class="stcap-footer" id="stcap-footer"></div>
       </div>
     `;
 
     document.body.appendChild(rootEl);
     if (supportsDialog) {
-        try {
-            rootEl.showModal();
-        } catch {
-            rootEl.className = 'stcap-overlay-fallback';
-        }
+        try { rootEl.showModal(); } catch { rootEl.setAttribute('open', ''); }
     }
-
     const closeModal = () => {
-        try { if (typeof rootEl.close === 'function' && rootEl.open) rootEl.close(); } catch {}
+        try { if (supportsDialog && rootEl.open) rootEl.close(); } catch {}
         rootEl.remove();
     };
-
-    rootEl.querySelector('.stcap-close').addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        closeModal();
-    });
-    rootEl.addEventListener('click', (e) => {
-        if (e.target === rootEl) closeModal();
-    });
-
+    rootEl.querySelector('.stcap-close')?.addEventListener('click', closeModal);
+    rootEl.addEventListener('click', (e) => { if (e.target === rootEl) closeModal(); });
     return { rootEl, closeModal };
 }
 
-async function openCapsuleModal(initialTab = 'export') {
+export async function openCapsuleModal(initialTab = 'export') {
     ensureCriticalStyles();
-    const { rootEl } = createTopLayerModalShell(initialTab);
+    const { rootEl } = createModalShell(initialTab);
     const bodyEl = rootEl.querySelector('#stcap-body');
     const footerEl = rootEl.querySelector('#stcap-footer');
 
-    const ctx = getCtx();
-    const characters = ctx.characters || [];
-    let currentChid = ctx.characterId !== undefined && ctx.characterId !== null && characters[ctx.characterId]
-        ? Number(ctx.characterId)
-        : (characters.length > 0 ? 0 : -1);
-
-    let activeTab = initialTab;
-    let inspected = null;
-
-    rootEl.querySelectorAll('.stcap-tab').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            e.preventDefault();
-            activeTab = btn.dataset.tab;
-            rootEl.querySelectorAll('.stcap-tab').forEach(b => b.classList.toggle('active', b === btn));
-            if (activeTab === 'export') await renderExportTab();
-            else renderImportTab();
+    rootEl.querySelectorAll('.stcap-tab').forEach(tab => {
+        tab.addEventListener('click', async () => {
+            rootEl.querySelectorAll('.stcap-tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            const tName = tab.dataset.tab;
+            if (tName === 'export') await renderExportTab();
+            else if (tName === 'import') renderImportTab();
+            else await renderCleanTab();
         });
     });
 
     async function renderExportTab() {
-        try {
-            if (characters.length === 0 || currentChid < 0) {
-                bodyEl.innerHTML = `<div style="padding:28px;text-align:center;color:#94a3b8;">当前酒馆中暂无可导出的角色卡（如果你刚打开酒馆，请先点进任意角色或等待角色列表加载完成）。</div>`;
-                footerEl.innerHTML = '';
-                return;
-            }
-            bodyEl.innerHTML = `<div style="padding:28px;text-align:center;color:#8ab4f8;">正在扫描角色绑定的预设、正则、多世界书与全部聊天分支...</div>`;
-            footerEl.innerHTML = '';
+        bodyEl.innerHTML = `<div style="padding:20px;text-align:center;color:#94a3b8;">正在扫描当前角色绑定的多世界书与预设...</div>`;
+        footerEl.innerHTML = '';
 
-            inspected = await inspectCharacterWorkspace(currentChid);
-            if (!inspected) {
-                bodyEl.innerHTML = `<div style="padding:28px;text-align:center;color:#f87171;">无法读取角色索引 #${currentChid}。</div>`;
-                return;
-            }
-
-            const charOptionsHtml = characters.map((c, idx) =>
-                `<option value="${idx}" ${idx === currentChid ? 'selected' : ''}>${escapeHtml(c.name || c.avatar)} (${escapeHtml(c.avatar || idx)})</option>`
-            ).join('');
-
-            const wbItemsHtml = inspected.worldbookOptions.map(wb => `
-              <label class="stcap-item stcap-wb-row" data-name="${escapeHtml(wb.name.toLowerCase())}">
-                <input type="checkbox" class="stcap-wb-chk" value="${escapeHtml(wb.name)}" ${wb.preselected ? 'checked' : ''} />
-                <span class="stcap-item-label" title="${escapeHtml(wb.name)}">${escapeHtml(wb.name)}</span>
-                ${wb.roles.length ? `<span class="stcap-badge warn">${escapeHtml(wb.roles.join(' · '))}</span>` : `<span class="stcap-item-sub">未绑定</span>`}
-              </label>
-            `).join('');
-
-            const presetItemsHtml = inspected.presetNames.map(pName => {
-                const isAct = pName === inspected.activePresetName;
-                return `
-                  <label class="stcap-item">
-                    <input type="checkbox" class="stcap-preset-chk" value="${escapeHtml(pName)}" ${isAct ? 'checked' : ''} />
-                    <span class="stcap-item-label" title="${escapeHtml(pName)}">${escapeHtml(pName)}</span>
-                    ${isAct ? `<span class="stcap-badge">当前激活</span>` : ''}
-                  </label>
-                `;
-            }).join('');
-
-            const chatItemsHtml = inspected.chatFiles.length > 0
-                ? inspected.chatFiles.map(cf => `
-                  <label class="stcap-item">
-                    <input type="checkbox" class="stcap-chat-chk" value="${escapeHtml(cf.file_id)}" checked />
-                    <span class="stcap-item-label" title="${escapeHtml(cf.file_id)}">${escapeHtml(cf.file_id)}</span>
-                    <span class="stcap-item-sub">${cf.is_active ? '★当前 · ' : ''}${cf.message_count} 条 ${cf.file_size ? `· ${escapeHtml(cf.file_size)}` : ''}</span>
-                  </label>
-                `).join('')
-                : `<div style="color:#64748b;font-size:12px;padding:8px;">该角色暂无已保存的历史聊天记录 (.jsonl)</div>`;
-
+        const info = await inspectCurrentCharacterForExport();
+        if (!info) {
             bodyEl.innerHTML = `
-              <div class="stcap-char-bar">
-                <img class="stcap-avatar-preview" src="/characters/${encodeURIComponent(inspected.avatar)}" onerror="this.style.display='none'" />
-                <div style="flex:1;min-width:200px;">
-                  <div style="font-size:12px;color:#94a3b8;margin-bottom:4px;">选择要打包的角色卡（已自动勾选其绑定的世界书、预设、正则与全部聊天记录）</div>
-                  <select class="stcap-select" id="stcap-char-select">${charOptionsHtml}</select>
+              <div class="stcap-section" style="text-align:center;padding:24px;">
+                <div style="font-size:15px;font-weight:700;color:#fca5a5;">当前未打开任何角色卡</div>
+                <div style="font-size:12px;color:#94a3b8;margin-top:6px;">请先点进一张角色卡，再点击「打包单卡导出」；或切换到上方标签执行导入/清理。</div>
+              </div>
+            `;
+            return;
+        }
+
+        const defaultPfx = makeFreshPrefix('ST');
+        const avatarSrc = `/characters/${encodeURIComponent(info.avatar)}`;
+
+        bodyEl.innerHTML = `
+          <div class="stcap-char-banner">
+            <img src="${avatarSrc}" onerror="this.style.display='none'" alt="avatar" />
+            <div class="stcap-char-meta">
+              <div class="stcap-char-name">${escapeHtml(info.rawName)}</div>
+              <div class="stcap-char-sub">
+                已绑定世界书 <b>${info.boundCount}</b> 本 · 当前预设 <b>${escapeHtml(info.activePresetName || '无')}</b> · 局部正则 <b>${info.scopedRegex.length}</b> 条 · 预设正则 <b>${info.presetRegex.length}</b> 条
+              </div>
+            </div>
+          </div>
+
+          <div class="stcap-section" style="border-color:rgba(74,222,128,0.4);background:rgba(74,222,128,0.06);">
+            <div class="stcap-section-head">
+              <span class="stcap-section-title">🏷️ 统一最前端唯一前缀（自动加在角色卡、全部世界书和预设最前面，删卡时一并全删）</span>
+              <button type="button" class="stcap-mini-btn" id="stcap-regen-pfx">🎲 刷新唯一前缀</button>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+              <input type="text" class="stcap-search" id="stcap-export-pfx" value="${escapeHtml(defaultPfx)}" style="max-width:240px;font-weight:700;color:#4ade80;" />
+              <span style="font-size:12px;color:#cbd5e1;" id="stcap-pfx-preview">导出卡名预览：<b>${escapeHtml(applyFrontPrefix(defaultPfx, info.cleanBaseName))}</b></span>
+            </div>
+          </div>
+
+          <div class="stcap-grid">
+            <div class="stcap-section">
+              <div class="stcap-section-title">🎛️ 内置绑定预设与正则</div>
+              <label class="stcap-item">
+                <input type="checkbox" id="stcap-inc-preset" checked />
+                <span class="stcap-item-label">内置专属预设（切进该卡自动切此预设）</span>
+              </label>
+              <select id="stcap-preset-sel" class="stcap-search">
+                ${info.presetNames.map(p => `<option value="${escapeHtml(p)}" ${p === info.activePresetName ? 'selected' : ''}>${escapeHtml(p)}</option>`).join('')}
+              </select>
+              <label class="stcap-item">
+                <input type="checkbox" id="stcap-inc-sregex" checked />
+                <span class="stcap-item-label">内置角色局部正则 (${info.scopedRegex.length} 条)</span>
+              </label>
+              <div style="font-size:11px;color:#94a3b8;line-height:1.45;">
+                预设自带的 ${info.presetRegex.length} 条正则已包含在专属预设内部，导入后自动授权启用，删卡时连同预设与全部世界书一起删除。
+              </div>
+            </div>
+
+            <div class="stcap-section">
+              <div class="stcap-section-head">
+                <span class="stcap-section-title">🌍 内置多本世界书 (已选 <span id="stcap-wb-cnt">${info.worldbookOptions.filter(w => w.defaultChecked).length}</span> 本)</span>
+                <div class="stcap-mini-actions">
+                  <button type="button" class="stcap-mini-btn" id="stcap-wb-bound">仅角色绑定</button>
+                  <button type="button" class="stcap-mini-btn" id="stcap-wb-all">全选</button>
                 </div>
               </div>
-
-              <div class="stcap-grid">
-                <div class="stcap-section">
-                  <div class="stcap-section-head">
-                    <span class="stcap-section-title">🌍 多本世界书 <span class="stcap-badge">${inspected.worldbookOptions.filter(w => w.preselected).length} 绑定 / 共 ${inspected.worldbookOptions.length}</span></span>
-                    <div class="stcap-mini-actions">
-                      <button type="button" class="stcap-mini-btn" id="stcap-wb-bound">仅绑定</button>
-                      <button type="button" class="stcap-mini-btn" id="stcap-wb-all">全选</button>
-                      <button type="button" class="stcap-mini-btn" id="stcap-wb-none">清空</button>
-                    </div>
-                  </div>
-                  <input type="text" class="stcap-search" id="stcap-wb-search" placeholder="搜索世界书名称（可勾选任意多本一起打包）..." />
-                  <div class="stcap-list" id="stcap-wb-list">${wbItemsHtml || '<div style="color:#64748b;font-size:12px;padding:6px;">暂无世界书</div>'}</div>
-                </div>
-
-                <div class="stcap-section">
-                  <div class="stcap-section-head">
-                    <span class="stcap-section-title">💬 所有聊天记录 <span class="stcap-badge">${inspected.chatFiles.length} 个分支</span></span>
-                    <div class="stcap-mini-actions">
-                      <button type="button" class="stcap-mini-btn" id="stcap-chat-all">全选</button>
-                      <button type="button" class="stcap-mini-btn" id="stcap-chat-none">清空</button>
-                    </div>
-                  </div>
-                  <label class="stcap-item" style="background:rgba(102,157,246,0.1);border:1px solid rgba(102,157,246,0.28);">
-                    <input type="checkbox" id="stcap-slim-chat-media" checked />
-                    <span class="stcap-item-label" title="剥离聊天楼层内嵌的生成插图与音频 Base64，100%保留文字、思维链、Swipes与变量">🧹 瘦身：剥离聊天内嵌大图/语音 Base64</span>
+              <input type="text" class="stcap-search" id="stcap-wb-filter" placeholder="搜索世界书..." />
+              <div class="stcap-list" id="stcap-wb-list">
+                ${info.worldbookOptions.map(w => `
+                  <label class="stcap-item" data-name="${escapeHtml(w.name.toLowerCase())}">
+                    <input type="checkbox" class="stcap-wb-cb" value="${escapeHtml(w.name)}" ${w.defaultChecked ? 'checked' : ''} />
+                    <span class="stcap-item-label" title="${escapeHtml(w.name)}">${escapeHtml(w.name)}</span>
+                    ${w.isPrimary ? '<span class="stcap-item-sub">主书</span>' : w.isExtra ? '<span class="stcap-item-sub">附加</span>' : w.isGlobal ? '<span class="stcap-item-sub">全局</span>' : ''}
                   </label>
-                  <div class="stcap-list">${chatItemsHtml}</div>
-                </div>
+                `).join('')}
+              </div>
+            </div>
 
-                <div class="stcap-section">
-                  <div class="stcap-section-head">
-                    <span class="stcap-section-title">🎛️ 预设 (Presets) <span class="stcap-badge">${escapeHtml(ctx.mainApi || 'Chat')}</span></span>
-                  </div>
-                  <div class="stcap-list">
-                    <label class="stcap-item">
-                      <input type="checkbox" id="stcap-inc-live-preset" checked />
-                      <span class="stcap-item-label">当前实时生效预设参数 (含卡绑定预设)</span>
-                    </label>
-                    ${presetItemsHtml}
-                  </div>
-                </div>
-
-                <div class="stcap-section">
-                  <div class="stcap-section-head">
-                    <span class="stcap-section-title">🧬 正则 · 酒馆助手 · 人设</span>
-                  </div>
-                  <div class="stcap-list">
-                    <label class="stcap-item">
-                      <input type="checkbox" id="stcap-inc-global-regex" checked />
-                      <span class="stcap-item-label">全局正则脚本 (Global Regex)</span>
-                      <span class="stcap-badge">${inspected.globalRegex.length} 条</span>
-                    </label>
-                    <label class="stcap-item">
-                      <input type="checkbox" id="stcap-inc-scoped-regex" checked />
-                      <span class="stcap-item-label">角色局部正则 (Character Regex)</span>
-                      <span class="stcap-badge">${inspected.scopedRegex.length} 条</span>
-                    </label>
-                    <label class="stcap-item">
-                      <input type="checkbox" id="stcap-inc-preset-regex" checked />
-                      <span class="stcap-item-label">预设绑定正则 (Preset Regex)</span>
-                      <span class="stcap-badge">${inspected.presetRegex.length} 条</span>
-                    </label>
-                    <label class="stcap-item">
-                      <input type="checkbox" id="stcap-inc-th-scripts" checked />
-                      <span class="stcap-item-label">酒馆助手脚本 (TavernHelper)</span>
-                      <span class="stcap-badge">全局 ${inspected.thGlobalScripts.length} · 角色 ${inspected.thCharScripts.length}</span>
-                    </label>
-                    <label class="stcap-item">
-                      <input type="checkbox" id="stcap-inc-persona" checked />
-                      <span class="stcap-item-label">当前用户名与人设描述 ({{user}})</span>
-                      <span class="stcap-item-sub">${escapeHtml(ctx.name1 || '')}</span>
-                    </label>
-                  </div>
+            <div class="stcap-section">
+              <div class="stcap-section-head">
+                <span class="stcap-section-title">💬 可选附带聊天记录 (默认不带，保持新卡干净)</span>
+                <div class="stcap-mini-actions">
+                  <button type="button" class="stcap-mini-btn" id="stcap-chat-none">清空</button>
+                  <button type="button" class="stcap-mini-btn" id="stcap-chat-all">全选(${info.chatFiles.length})</button>
                 </div>
               </div>
-            `;
-
-            const showMobileShare = canShareFileMobile();
-            footerEl.innerHTML = `
-              <div class="stcap-status" id="stcap-status">
-                ${isLukerAndroidApp()
-                    ? '已识别 Luker 安卓客户端：点击下方导出将直接唤起安卓系统原生文件保存框。'
-                    : '就绪：单卡 PNG 模式会将所有数据 GZIP 高压缩写入 PNG 的 st_capsule 块。'}
+              <div class="stcap-list" id="stcap-chat-list">
+                ${info.chatFiles.length === 0 ? '<div style="color:#64748b;font-size:12px;padding:6px;">暂无历史聊天分支</div>' : info.chatFiles.map(c => `
+                  <label class="stcap-item">
+                    <input type="checkbox" class="stcap-chat-cb" value="${escapeHtml(c.fileId)}" />
+                    <span class="stcap-item-label">${escapeHtml(c.fileId)}</span>
+                    <span class="stcap-item-sub">${escapeHtml(String(c.messageCount))} 条</span>
+                  </label>
+                `).join('')}
               </div>
-              <div class="stcap-export-btns">
-                <button type="button" class="stcap-action-btn secondary" id="stcap-btn-json">📄 导出独立文件 (.stcapsule.json)</button>
-                <button type="button" class="stcap-action-btn" id="stcap-btn-png">🖼️ 绑定在一张卡里导出 (.capsule.png)</button>
-                ${showMobileShare ? `<button type="button" class="stcap-action-btn" id="stcap-btn-share" style="background:linear-gradient(135deg,#059669,#0284c7);">📲 系统转发分享 (.capsule.png)</button>` : ''}
-              </div>
-            `;
+            </div>
+          </div>
+          <div id="stcap-export-dl-box" style="display:none;"></div>
+        `;
 
-            bodyEl.querySelector('#stcap-char-select').addEventListener('change', async (e) => {
-                currentChid = Number(e.target.value);
-                await renderExportTab();
+        footerEl.innerHTML = `
+          <div class="stcap-status" id="stcap-status">提示：手机/微信传输强烈推荐导出 .charx（酒馆原生「导入角色卡」直接识别且微信不压缩）</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <button type="button" class="stcap-secondary-btn" id="stcap-btn-png">🖼️ 导出全内置 .png 卡</button>
+            <button type="button" class="stcap-primary-btn" id="stcap-btn-charx">📦 导出全内置 .charx 卡 (推荐)</button>
+          </div>
+        `;
+
+        const pfxInput = bodyEl.querySelector('#stcap-export-pfx');
+        const pfxPreview = bodyEl.querySelector('#stcap-pfx-preview');
+        const refreshPfxPreview = () => {
+            const p = normalizeFrontPrefix(pfxInput.value);
+            pfxPreview.innerHTML = `导出卡名预览：<b>${escapeHtml(applyFrontPrefix(p, info.cleanBaseName))}</b>`;
+        };
+        pfxInput.addEventListener('input', refreshPfxPreview);
+        bodyEl.querySelector('#stcap-regen-pfx')?.addEventListener('click', () => {
+            pfxInput.value = makeFreshPrefix('ST');
+            refreshPfxPreview();
+        });
+
+        const updateWbCnt = () => {
+            bodyEl.querySelector('#stcap-wb-cnt').textContent = String(bodyEl.querySelectorAll('.stcap-wb-cb:checked').length);
+        };
+        bodyEl.querySelector('#stcap-wb-list')?.addEventListener('change', updateWbCnt);
+        bodyEl.querySelector('#stcap-wb-bound')?.addEventListener('click', () => {
+            const bSet = new Set(info.worldbookOptions.filter(w => w.defaultChecked).map(w => w.name));
+            bodyEl.querySelectorAll('.stcap-wb-cb').forEach(cb => { cb.checked = bSet.has(cb.value); });
+            updateWbCnt();
+        });
+        bodyEl.querySelector('#stcap-wb-all')?.addEventListener('click', () => {
+            bodyEl.querySelectorAll('.stcap-wb-cb').forEach(cb => { cb.checked = true; });
+            updateWbCnt();
+        });
+        bodyEl.querySelector('#stcap-wb-filter')?.addEventListener('input', (e) => {
+            const q = e.target.value.trim().toLowerCase();
+            bodyEl.querySelectorAll('#stcap-wb-list .stcap-item').forEach(row => {
+                row.style.display = (!q || (row.dataset.name || '').includes(q)) ? 'flex' : 'none';
             });
+        });
+        bodyEl.querySelector('#stcap-chat-none')?.addEventListener('click', () => {
+            bodyEl.querySelectorAll('.stcap-chat-cb').forEach(cb => { cb.checked = false; });
+        });
+        bodyEl.querySelector('#stcap-chat-all')?.addEventListener('click', () => {
+            bodyEl.querySelectorAll('.stcap-chat-cb').forEach(cb => { cb.checked = true; });
+        });
 
-            bodyEl.querySelector('#stcap-wb-search').addEventListener('input', (e) => {
-                const q = e.target.value.trim().toLowerCase();
-                bodyEl.querySelectorAll('.stcap-wb-row').forEach(row => {
-                    row.style.display = !q || row.dataset.name.includes(q) ? '' : 'none';
-                });
-            });
+        const runExport = async (format) => {
+            const statusEl = footerEl.querySelector('#stcap-status');
+            const btns = footerEl.querySelectorAll('button');
+            btns.forEach(b => { b.disabled = true; });
+            try {
+                const prefix = normalizeFrontPrefix(pfxInput.value);
+                const finalCardName = applyFrontPrefix(prefix, info.cleanBaseName);
+                const selectedOrigWbs = [...bodyEl.querySelectorAll('.stcap-wb-cb:checked')].map(c => c.value);
 
-            bodyEl.querySelector('#stcap-wb-all').addEventListener('click', () => {
-                bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { if (c.closest('.stcap-wb-row').style.display !== 'none') c.checked = true; });
-            });
-            bodyEl.querySelector('#stcap-wb-none').addEventListener('click', () => {
-                bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { c.checked = false; });
-            });
-            bodyEl.querySelector('#stcap-wb-bound').addEventListener('click', () => {
-                const boundSet = new Set(inspected.worldbookOptions.filter(w => w.preselected).map(w => w.name));
-                bodyEl.querySelectorAll('.stcap-wb-chk').forEach(c => { c.checked = boundSet.has(c.value); });
-            });
-
-            bodyEl.querySelector('#stcap-chat-all').addEventListener('click', () => {
-                bodyEl.querySelectorAll('.stcap-chat-chk').forEach(c => { c.checked = true; });
-            });
-            bodyEl.querySelector('#stcap-chat-none').addEventListener('click', () => {
-                bodyEl.querySelectorAll('.stcap-chat-chk').forEach(c => { c.checked = false; });
-            });
-
-            footerEl.querySelector('#stcap-btn-png').addEventListener('click', () => runExport('png', false));
-            footerEl.querySelector('#stcap-btn-json').addEventListener('click', () => runExport('json', false));
-            footerEl.querySelector('#stcap-btn-share')?.addEventListener('click', () => runExport('png', true));
-        } catch (err) {
-            console.error('[ST-Capsule] renderExportTab error:', err);
-            bodyEl.innerHTML = `<div style="padding:20px;color:#fca5a5;background:rgba(127,29,29,0.25);border-radius:8px;">加载角色打包面板出错：${escapeHtml(err?.message || String(err))}</div>`;
-        }
-    }
-
-    async function runExport(mode, useMobileShare = false) {
-        const statusEl = footerEl.querySelector('#stcap-status');
-        const btnPng = footerEl.querySelector('#stcap-btn-png');
-        const btnJson = footerEl.querySelector('#stcap-btn-json');
-        const btnShare = footerEl.querySelector('#stcap-btn-share');
-        btnPng.disabled = true;
-        btnJson.disabled = true;
-        if (btnShare) btnShare.disabled = true;
-
-        try {
-            const { pmMod, puMod, wiMod, openaiMod } = await getHostMods();
-            const power_user = puMod.power_user || ctx.powerUserSettings || {};
-            const world_info = wiMod.world_info || {};
-            const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
-
-            const selectedWbs = [...bodyEl.querySelectorAll('.stcap-wb-chk:checked')].map(c => c.value);
-            const selectedChats = [...bodyEl.querySelectorAll('.stcap-chat-chk:checked')].map(c => c.value);
-            const slimChatMedia = Boolean(bodyEl.querySelector('#stcap-slim-chat-media')?.checked);
-            const selectedPresets = [...bodyEl.querySelectorAll('.stcap-preset-chk:checked')].map(c => c.value);
-            const incLivePreset = bodyEl.querySelector('#stcap-inc-live-preset')?.checked;
-
-            const incGlobalRegex = bodyEl.querySelector('#stcap-inc-global-regex')?.checked;
-            const incScopedRegex = bodyEl.querySelector('#stcap-inc-scoped-regex')?.checked;
-            const incPresetRegex = bodyEl.querySelector('#stcap-inc-preset-regex')?.checked;
-            const incThScripts = bodyEl.querySelector('#stcap-inc-th-scripts')?.checked;
-            const incPersona = bodyEl.querySelector('#stcap-inc-persona')?.checked;
-
-            statusEl.textContent = `正在读取头像与角色卡基础结构...`;
-            const pngBytes = await fetchCharacterAvatarBytes(inspected.avatar);
-            const v2Card = buildStandardV2Card(inspected.charObj);
-
-            // 1. Fetch selected worldbooks
-            const booksOut = [];
-            for (let i = 0; i < selectedWbs.length; i++) {
-                const wbName = selectedWbs[i];
-                statusEl.textContent = `正在打包世界书 (${i + 1}/${selectedWbs.length}): ${wbName}...`;
-                try {
-                    const wbData = await apiPost('/api/worldinfo/get', { name: wbName });
-                    if (wbData && typeof wbData === 'object') {
-                        const opt = inspected.worldbookOptions.find(o => o.name === wbName);
-                        booksOut.push({
-                            name: wbName,
-                            roles: opt?.roles || [],
-                            entry_count: Object.keys(wbData?.entries || {}).length,
-                            data: wbData,
-                        });
-                    }
-                } catch (err) {
-                    console.warn('[ST-Capsule] Failed reading worldbook:', wbName, err);
-                }
-            }
-
-            const primaryBookName = v2Card.data?.extensions?.world;
-            const primaryFound = booksOut.find(b => b.name === primaryBookName);
-            if (primaryFound?.data?.entries && !v2Card.data.character_book) {
-                const entriesArr = Object.values(primaryFound.data.entries).map((e, idx) => ({
-                    id: e.uid ?? idx,
-                    keys: Array.isArray(e.key) ? e.key : [],
-                    secondary_keys: Array.isArray(e.keysecondary) ? e.keysecondary : [],
-                    comment: e.comment || '',
-                    content: e.content || '',
-                    constant: Boolean(e.constant),
-                    selective: Boolean(e.selective),
-                    insertion_order: e.order ?? 100,
-                    enabled: !e.disable,
-                    position: e.position === 0 ? 'before_char' : 'after_char',
-                    extensions: e,
-                }));
-                v2Card.data.character_book = { name: primaryBookName, entries: entriesArr };
-            }
-
-            // 2. Fetch presets (including Luker live / card-bound preset fallback)
-            statusEl.textContent = `正在提取预设配置...`;
-            const pm = typeof getPresetManager === 'function' ? getPresetManager() : null;
-            const presetItems = [];
-            const seenPresetNames = new Set();
-
-            for (const pName of selectedPresets) {
-                try {
-                    const pData = pm?.getPresetSettings?.(pName) || pm?.getCompletionPresetByName?.(pName);
-                    if (pData) {
-                        presetItems.push({
-                            name: pName,
-                            is_active: pName === inspected.activePresetName,
-                            data: safeJsonClone(pData, {}),
-                        });
-                        seenPresetNames.add(pName);
-                    }
-                } catch (e) {
-                    console.warn('[ST-Capsule] Preset fetch warning:', pName, e);
-                }
-            }
-
-            if (incLivePreset && openaiMod?.oai_settings && (!inspected.activePresetName || !seenPresetNames.has(inspected.activePresetName))) {
-                const liveName = inspected.activePresetName || '当前实时运行预设';
-                presetItems.unshift({
-                    name: liveName,
-                    is_active: true,
-                    data: safeJsonClone(openaiMod.oai_settings, {}),
-                });
-            }
-
-            const stripMsgMediaInPlace = (msgs) => {
-                if (!slimChatMedia || !Array.isArray(msgs)) return msgs;
-                const dataUriRe = /data:[a-zA-Z0-9/+.-]+;base64,[A-Za-z0-9+/=\s]{1024,}/g;
-                return msgs.map(raw => {
-                    if (!raw || typeof raw !== 'object') return raw;
-                    const m = safeJsonClone(raw, raw);
-                    if (typeof m.mes === 'string' && m.mes.length > 1200) {
-                        m.mes = m.mes.replace(dataUriRe, '[inline-media-omitted]');
-                    }
-                    if (Array.isArray(m.swipes)) {
-                        m.swipes = m.swipes.map(s => (typeof s === 'string' && s.length > 1200 ? s.replace(dataUriRe, '[inline-media-omitted]') : s));
-                    }
-                    if (m.extra && typeof m.extra === 'object') {
-                        delete m.extra.image;
-                        delete m.extra.inline_image;
-                        delete m.extra.audio;
-                        if (Array.isArray(m.extra.media)) delete m.extra.media;
-                        if (Array.isArray(m.extra.image_swipes)) delete m.extra.image_swipes;
-                    }
-                    return m;
-                });
-            };
-
-            // 3. Fetch all selected chat histories
-            const chatsOut = [];
-            for (let i = 0; i < selectedChats.length; i++) {
-                const chatId = selectedChats[i];
-                statusEl.textContent = `正在提取聊天记录 (${i + 1}/${selectedChats.length}): ${chatId}...`;
-                try {
-                    const rawResp = await apiPost('/api/chats/get', {
-                        ch_name: inspected.name,
-                        file_name: chatId,
-                        avatar_url: inspected.avatar,
+                statusEl.textContent = `正在读取 ${selectedOrigWbs.length} 本世界书...`;
+                const bundledBooks = [];
+                for (let i = 0; i < selectedOrigWbs.length; i++) {
+                    const origWbName = selectedOrigWbs[i];
+                    const prefixedWbName = applyFrontPrefix(prefix, origWbName);
+                    const wbData = await apiPost('/api/worldinfo/get', { name: origWbName });
+                    const wbCopy = JSON.parse(JSON.stringify(wbData || { entries: {} }));
+                    wbCopy.name = prefixedWbName;
+                    bundledBooks.push({
+                        name: prefixedWbName,
+                        is_primary: i === 0,
+                        data: wbCopy,
                     });
-                    let messages = normalizeChatMessagesResponse(rawResp);
-                    if (!messages && chatId === inspected.charObj.chat && Array.isArray(ctx.chat) && ctx.chat.length > 0) {
-                        messages = [{ user_name: ctx.name1, character_name: inspected.name, chat_metadata: safeJsonClone(ctx.chatMetadata, {}) }, ...safeJsonClone(ctx.chat, [])];
-                    }
-                    if (Array.isArray(messages) && messages.length > 0) {
-                        messages = stripMsgMediaInPlace(messages);
-                        const metaObj = messages[0]?.chat_metadata ? messages[0] : { chat_metadata: {} };
-                        const msgCount = messages.filter(m => !m.chat_metadata || m.mes !== undefined).length;
-                        chatsOut.push({
-                            file_id: chatId,
-                            file_name: `${chatId}.jsonl`,
-                            is_active_chat: chatId === inspected.charObj.chat,
-                            message_count: msgCount,
-                            chat_metadata: metaObj.chat_metadata || {},
-                            messages,
-                        });
-                    }
-                } catch (err) {
-                    console.warn('[ST-Capsule] Chat fetch warning:', chatId, err);
                 }
-            }
 
-            // If character has unsaved in-memory chat messages and no .jsonl file yet, include current memory chat
-            if (chatsOut.length === 0 && ctx.characterId == inspected.chid && Array.isArray(ctx.chat) && ctx.chat.length > 0) {
-                const memMsgs = [
-                    { user_name: ctx.name1 || 'User', character_name: inspected.name, chat_metadata: safeJsonClone(ctx.chatMetadata, {}) },
-                    ...safeJsonClone(ctx.chat, []),
-                ];
-                chatsOut.push({
-                    file_id: `${inspected.name}_current`,
-                    file_name: `${inspected.name}_current.jsonl`,
-                    is_active_chat: true,
-                    message_count: ctx.chat.length,
-                    chat_metadata: safeJsonClone(ctx.chatMetadata, {}),
-                    messages: memMsgs,
-                });
-            }
-
-            // 4. Persona snapshot
-            let personaOut = null;
-            if (incPersona) {
-                const userAvatar = power_user?.personas
-                    ? Object.keys(power_user.personas).find(k => power_user.personas[k] === ctx.name1)
-                    : null;
-                const descObj = userAvatar ? power_user?.persona_descriptions?.[userAvatar] : null;
-                personaOut = {
-                    user_name: ctx.name1 || '',
-                    user_avatar: userAvatar || '',
-                    description: descObj?.description || power_user?.persona_description || '',
-                    lorebook: descObj?.lorebook || '',
-                };
-            }
-
-            const auxExtraBooks = inspected.worldbookOptions
-                .filter(w => w.roles.includes('角色附加世界书'))
-                .map(w => w.name);
-
-            const capsuleObj = {
-                spec: 'st_capsule_v1',
-                version: '1.2.0',
-                exported_at: new Date().toISOString(),
-                source: isLukerAndroidApp() ? 'Luker-Android-ST-Capsule-Packer' : 'SillyTavern-ST-Capsule-Packer',
-                character: {
-                    name: inspected.name,
-                    avatar: inspected.avatar,
-                    card: v2Card,
-                    ...(mode === 'json' ? { avatar_png_base64: uint8ToBase64(pngBytes) } : {}),
-                },
-                persona: personaOut,
-                presets: {
-                    active_preset_name: inspected.activePresetName,
-                    items: presetItems,
-                    power_user_context: safeJsonClone({
-                        instruct: power_user?.instruct || null,
-                        context: power_user?.context || null,
-                        sysprompt: power_user?.sysprompt || null,
-                        reasoning: power_user?.reasoning || null,
-                    }, {}),
-                },
-                regex: {
-                    global: incGlobalRegex ? safeJsonClone(inspected.globalRegex, []) : [],
-                    scoped: incScopedRegex ? safeJsonClone(inspected.scopedRegex, []) : [],
-                    preset: incPresetRegex ? safeJsonClone(inspected.presetRegex, []) : [],
-                },
-                tavern_helper: {
-                    global_scripts: incThScripts ? safeJsonClone(inspected.thGlobalScripts, []) : [],
-                    character_scripts: incThScripts ? safeJsonClone(inspected.thCharScripts, []) : [],
-                },
-                worldbooks: {
-                    bindings: {
-                        primary: v2Card.data?.extensions?.world || null,
-                        extra: auxExtraBooks,
-                        global: safeJsonClone(world_info?.globalSelect || [], []),
-                    },
-                    books: booksOut,
-                },
-                chats: chatsOut,
-            };
-
-            const safeBase = sanitizeDownloadName(inspected.name);
-            const jsonStr = JSON.stringify(capsuleObj, null, mode === 'json' ? 2 : 0);
-
-            const renderManualSaveBox = (saved, fileName, mimeType, mb) => {
-                let oldBox = bodyEl.querySelector('#stcap-result-box');
-                if (oldBox) oldBox.remove();
-                const box = document.createElement('div');
-                box.id = 'stcap-result-box';
-                box.style.cssText = 'padding:12px;border-radius:10px;background:rgba(6,78,59,0.35);border:1px solid rgba(52,211,153,0.55);display:flex;flex-direction:column;gap:8px;';
-                box.innerHTML = `
-                  <div style="font-size:13px;font-weight:700;color:#6ee7b7;">
-                    ✅ 打包完成：${escapeHtml(fileName)} (${mb} MB · 通道: ${escapeHtml(saved.via)})
-                  </div>
-                  <div style="font-size:11.5px;color:#d1fae5;line-height:1.5;">
-                    ${saved.staged?.ok
-                        ? `文件已同步写入酒馆本地目录：<code>data/default-user${escapeHtml(saved.staged.relPath)}</code>。<br/>如果手机系统未自动弹出「选择保存位置」，请直接点下面任意一种保底方式保存：`
-                        : `如果未自动弹出保存框，请点击下方按钮重试保存：`}
-                  </div>
-                  <div style="display:flex;flex-wrap:wrap;gap:8px;">
-                    ${saved.staged?.ok && window.LukerAndroid?.saveFileFromUrl ? `<button type="button" class="stcap-mini-btn" id="stcap-retry-saf" style="padding:6px 10px;border-color:#34d399;color:#fff;font-weight:600;">📂 重新唤起安卓选择保存位置</button>` : ''}
-                    ${saved.staged?.ok ? `<a href="${escapeHtml(saved.staged.fullUrl)}" download="${escapeHtml(fileName)}" class="stcap-mini-btn" style="padding:6px 10px;border-color:#60a5fa;color:#fff;text-decoration:none;font-weight:600;">⬇️ 直链下载到手机 Download 栏</a>` : ''}
-                    ${saved.staged?.ok ? `<a href="${escapeHtml(saved.staged.fullUrl)}" target="_blank" rel="noopener" class="stcap-mini-btn" style="padding:6px 10px;color:#e2e8f0;text-decoration:none;">🌐 新窗口打开文件直链</a>` : ''}
-                  </div>
-                `;
-                bodyEl.prepend(box);
-                bodyEl.scrollTop = 0;
-                box.querySelector('#stcap-retry-saf')?.addEventListener('click', () => {
-                    try {
-                        window.LukerAndroid.saveFileFromUrl(JSON.stringify({
-                            url: saved.staged.fullUrl,
-                            fileName,
-                            mimeType,
-                            method: 'GET',
-                            headers: getCtx().getRequestHeaders ? getCtx().getRequestHeaders() : {},
-                        }));
-                    } catch (e) {
-                        console.error(e);
+                let bundledPreset = null;
+                if (bodyEl.querySelector('#stcap-inc-preset')?.checked) {
+                    const origPresetName = bodyEl.querySelector('#stcap-preset-sel')?.value || info.activePresetName;
+                    if (origPresetName && info.pm) {
+                        const rawP = info.pm.getCompletionPresetByName?.(origPresetName) || info.pm.getPresetSettings?.(origPresetName);
+                        if (rawP) {
+                            const prefixedPresetName = applyFrontPrefix(prefix, origPresetName);
+                            const pCopy = JSON.parse(JSON.stringify(rawP));
+                            pCopy.name = prefixedPresetName;
+                            bundledPreset = { api_id: 'openai', name: prefixedPresetName, data: pCopy };
+                        }
                     }
-                });
-            };
+                }
 
-            if (mode === 'png') {
-                statusEl.textContent = `正在进行 GZIP 压缩并上传至本地暂存服务...`;
-                const compressedChunkText = await compressCapsulePayload(jsonStr);
-                const finalPngBytes = buildCapsulePng(pngBytes, v2Card, compressedChunkText);
-                const fileName = `${safeBase}.capsule.png`;
-                const saved = await saveGeneratedPayload({
-                    bytes: finalPngBytes,
-                    filename: fileName,
-                    mimeType: 'image/png',
-                    extSuffix: '.capsule.png',
-                    useMobileShare,
+                const selectedChatIds = [...bodyEl.querySelectorAll('.stcap-chat-cb:checked')].map(c => c.value);
+                const bundledChats = [];
+                for (const cid of selectedChatIds) {
+                    const msgs = await apiPost('/api/chats/get', { ch_name: info.charObj.name, file_name: cid, avatar_url: info.avatar });
+                    if (Array.isArray(msgs)) bundledChats.push({ file_id: cid, messages: msgs });
+                }
+
+                // Fetch clean avatar image
+                const ctx = getCtx();
+                const headers = ctx.getRequestHeaders ? ctx.getRequestHeaders() : {};
+                let pureAvatarBytes = null;
+                const expResp = await fetch('/api/characters/export', {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({ format: 'png', avatar_url: info.avatar }),
                 });
-                const mb = (finalPngBytes.byteLength / 1024 / 1024).toFixed(2);
-                renderManualSaveBox(saved, fileName, 'image/png', mb);
-                statusEl.textContent = `✅ 打包完成：${fileName} (${mb} MB，见上方绿色保存卡片)`;
-                if (window.toastr) window.toastr.success(`已生成 ${fileName} (${mb} MB)`);
-            } else {
-                statusEl.textContent = `正在打包并上传至本地暂存服务...`;
-                const jsonBytes = new TextEncoder().encode(jsonStr);
-                const fileName = `${safeBase}.stcapsule.json`;
-                const saved = await saveGeneratedPayload({
-                    bytes: jsonBytes,
-                    filename: fileName,
-                    mimeType: 'application/json',
-                    extSuffix: '.json',
-                    useMobileShare,
-                });
-                const mb = (jsonBytes.byteLength / 1024 / 1024).toFixed(2);
-                renderManualSaveBox(saved, fileName, 'application/json', mb);
-                statusEl.textContent = `✅ 打包完成：${fileName} (${mb} MB，见上方绿色保存卡片)`;
-                if (window.toastr) window.toastr.success(`已生成 ${fileName} (${mb} MB)`);
+                if (expResp.ok) {
+                    pureAvatarBytes = stripPngToPureImage(new Uint8Array(await expResp.arrayBuffer()));
+                } else {
+                    const imgResp = await fetch(`/characters/${encodeURIComponent(info.avatar)}`);
+                    pureAvatarBytes = stripPngToPureImage(new Uint8Array(await imgResp.arrayBuffer()));
+                }
+
+                // Build V2 Card with embedded manifest + compressed bundle + TavernHelper fallback
+                const cardCopy = JSON.parse(JSON.stringify(info.charObj));
+                delete cardCopy.chat;
+                delete cardCopy.create_date;
+                cardCopy.name = finalCardName;
+                cardCopy.spec = 'chara_card_v2';
+                cardCopy.spec_version = '2.0';
+                cardCopy.data = cardCopy.data || {};
+                cardCopy.data.name = finalCardName;
+                cardCopy.data.extensions = cardCopy.data.extensions || {};
+
+                const allWbNames = bundledBooks.map(b => b.name);
+                const primaryWbName = allWbNames[0] || '';
+                const extraWbNames = allWbNames.slice(1);
+
+                if (primaryWbName) cardCopy.data.extensions.world = primaryWbName;
+                if (bodyEl.querySelector('#stcap-inc-sregex')?.checked && info.scopedRegex.length) {
+                    cardCopy.data.extensions.regex_scripts = info.scopedRegex.map(rx => ({
+                        ...rx,
+                        scriptName: applyFrontPrefix(prefix, rx.scriptName || 'Regex'),
+                    }));
+                }
+
+                cardCopy.data.extensions.st_capsule_manifest = {
+                    spec: BUNDLE_SPEC,
+                    version: '2.0.0',
+                    bundle_id: prefix.replace(/[【】\[\]\s]/g, ''),
+                    prefix,
+                    exported_at: new Date().toISOString(),
+                    primary_worldbook: primaryWbName,
+                    extra_worldbooks: extraWbNames,
+                    all_worldbooks: allWbNames,
+                    bound_preset: bundledPreset ? { api_id: 'openai', name: bundledPreset.name } : null,
+                    has_chats: bundledChats.length > 0,
+                    chat_count: bundledChats.length,
+                };
+
+                statusEl.textContent = '正在 GZIP 压缩多世界书与专属预设进单张角色卡...';
+                cardCopy.data.extensions.st_capsule_bundle = await gzipStringToBase64(JSON.stringify({
+                    worldbooks: bundledBooks,
+                    preset: bundledPreset,
+                    chats: bundledChats,
+                }));
+                cardCopy.data.extensions.tavern_helper = buildEmbeddedTavernHelperBootstrapScript(prefix);
+
+                const safeFileBase = sanitizeDownloadName(finalCardName);
+                let outBytes;
+                let outName;
+                let mimeType;
+                let extSuffix;
+
+                if (format === 'charx') {
+                    outBytes = buildCharXBytes(pureAvatarBytes, cardCopy);
+                    outName = `${safeFileBase}.charx`;
+                    mimeType = 'application/octet-stream';
+                    extSuffix = '.charx';
+                } else {
+                    outBytes = buildCleanCardPngBytes(pureAvatarBytes, cardCopy);
+                    outName = `${safeFileBase}.png`;
+                    mimeType = 'image/png';
+                    extSuffix = '.png';
+                }
+
+                const mb = (outBytes.byteLength / 1048576).toFixed(2);
+                const saved = await saveGeneratedPayload({ bytes: outBytes, filename: outName, mimeType, extSuffix });
+                statusEl.textContent = `✅ 已生成全内置单卡 ${outName} (${mb} MB)`;
+                if (saved.staged?.ok) {
+                    const dlBox = bodyEl.querySelector('#stcap-export-dl-box');
+                    dlBox.style.display = 'block';
+                    dlBox.innerHTML = `
+                      <div class="stcap-section" style="border-color:rgba(74,222,128,0.45);background:rgba(74,222,128,0.1);">
+                        <div style="font-size:12px;color:#86efac;font-weight:700;">📥 若未自动弹出保存框，点击下方直链保存 (${mb} MB)：</div>
+                        <a href="${escapeHtml(saved.staged.fullUrl)}" download="${escapeHtml(outName)}" target="_blank" class="stcap-primary-btn" style="text-decoration:none;display:inline-block;width:fit-content;">点击下载 ${escapeHtml(outName)}</a>
+                      </div>
+                    `;
+                }
+            } catch (err) {
+                console.error('[ST-Capsule v2] Export error:', err);
+                statusEl.textContent = `❌ 导出失败：${err?.message || err}`;
+            } finally {
+                btns.forEach(b => { b.disabled = false; });
             }
-        } catch (err) {
-            console.error('[ST-Capsule] Export error:', err);
-            statusEl.textContent = `❌ 导出失败：${err?.message || err}`;
-            if (window.toastr) window.toastr.error(String(err?.message || err));
-        } finally {
-            btnPng.disabled = false;
-            btnJson.disabled = false;
-            if (btnShare) btnShare.disabled = false;
-        }
+        };
+
+        footerEl.querySelector('#stcap-btn-charx')?.addEventListener('click', () => runExport('charx'));
+        footerEl.querySelector('#stcap-btn-png')?.addEventListener('click', () => runExport('png'));
     }
 
     function renderImportTab() {
         bodyEl.innerHTML = `
           <div class="stcap-dropzone" id="stcap-dropzone">
-            <div style="font-size:28px;margin-bottom:8px;">📥</div>
-            <div style="font-size:14px;font-weight:700;color:#e2e8f0;">点击选择或拖入 <code>.capsule.png</code> / <code>.stcapsule.json</code> / 普通角色卡 <code>.png</code></div>
-            <div style="font-size:12px;color:#94a3b8;margin-top:6px;">支持完整解析并按需勾选还原：角色卡本体、多本世界书及绑定关系、预设、全局/局部正则、全部历史聊天分支</div>
-            <input type="file" id="stcap-file-input" accept=".png,.json,image/png,application/json" style="display:none" />
+            <div style="font-size:15px;font-weight:700;color:#e9d5ff;">点击选择全内置角色卡 (.charx / .png) 或旧版胶囊 (.stcapsule.json)</div>
+            <div style="font-size:12px;color:#94a3b8;margin-top:6px;">
+              注：v2.0 全内置 .charx / .png 角色卡也可直接用酒馆自带的「导入角色卡」按钮导入，插件会自动解包全部世界书与专属预设。
+            </div>
+            <input type="file" id="stcap-file-in" accept=".charx,.png,.json,application/octet-stream,image/png,application/json" style="display:none;" />
           </div>
-          <div id="stcap-import-preview"></div>
+          <div id="stcap-imp-info"></div>
         `;
         footerEl.innerHTML = `
-          <div class="stcap-status" id="stcap-import-status">等待载入胶囊文件...</div>
-          <div class="stcap-export-btns">
-            <button type="button" class="stcap-action-btn" id="stcap-btn-restore" disabled>⚡ 一键还原勾选项到酒馆</button>
-          </div>
+          <div class="stcap-status" id="stcap-imp-status">请选择要导入的文件</div>
+          <button type="button" class="stcap-primary-btn" id="stcap-imp-go" disabled>⚡ 一键导入角色卡并自动挂齐世界书与预设</button>
         `;
 
         const dz = bodyEl.querySelector('#stcap-dropzone');
-        const fi = bodyEl.querySelector('#stcap-file-input');
+        const fi = bodyEl.querySelector('#stcap-file-in');
+        const infoBox = bodyEl.querySelector('#stcap-imp-info');
+        const stEl = footerEl.querySelector('#stcap-imp-status');
+        const goBtn = footerEl.querySelector('#stcap-imp-go');
+        let selectedFile = null;
+
         dz.addEventListener('click', () => fi.click());
-        dz.addEventListener('dragover', (e) => { e.preventDefault(); dz.classList.add('dragover'); });
-        dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
-        dz.addEventListener('drop', async (e) => {
-            e.preventDefault();
-            dz.classList.remove('dragover');
-            if (e.dataTransfer?.files?.[0]) await handleImportFile(e.dataTransfer.files[0]);
-        });
         fi.addEventListener('change', async () => {
-            if (fi.files?.[0]) await handleImportFile(fi.files[0]);
-        });
-    }
-
-    async function handleImportFile(file) {
-        const previewEl = bodyEl.querySelector('#stcap-import-preview');
-        const statusEl = footerEl.querySelector('#stcap-import-status');
-        const restoreBtn = footerEl.querySelector('#stcap-btn-restore');
-        try {
-            statusEl.textContent = `正在解析 ${file.name}...`;
-            const parsed = await parseAnyCapsuleOrCardFile(file);
-            const cap = parsed.capsule;
-            const books = cap.worldbooks?.books || [];
-            const chats = cap.chats || [];
-            const presets = cap.presets?.items || [];
-            const gRegex = cap.regex?.global || [];
-            const sRegex = cap.regex?.scoped || [];
-
-            const thGlobal = cap.tavern_helper?.global_scripts || [];
-            const existingChars = ctx.characters || [];
-            const rawCharName = cap.character?.name || 'Character';
-            const rawAvatarKey = String(cap.character?.avatar || '').replace(/\.png$/i, '');
-            const collidingChar = existingChars.find(c =>
-                (rawAvatarKey && String(c.avatar || '').replace(/\.png$/i, '') === rawAvatarKey) ||
-                c.name === rawCharName
-            );
-
-            previewEl.innerHTML = `
-              <div class="stcap-section" style="margin-top:8px;border-color:rgba(250,204,21,0.45);background:rgba(30,27,18,0.65);">
-                <div class="stcap-section-title">🛡️ 同名文件冲突处理策略 ${collidingChar ? `<span class="stcap-badge warn">检测到酒馆已有同名角色：${escapeHtml(collidingChar.name)}</span>` : `<span class="stcap-badge">未检测到角色重名</span>`}</div>
-                <label class="stcap-item">
-                  <input type="radio" name="stcap-collision-mode" value="overwrite" checked />
-                  <span class="stcap-item-label" style="white-space:normal;"><strong>🔄 原位覆盖升级（推荐更新设定时使用）</strong>：精准覆盖同名角色卡（不产生 <code>_1</code> 分身卡）、覆盖更新同名世界书与预设，并清理旧废案世界书绑定</span>
-                </label>
-                <label class="stcap-item">
-                  <input type="radio" name="stcap-collision-mode" value="coexist" />
-                  <span class="stcap-item-label" style="white-space:normal;"><strong>🆕 加后缀独立并存（不覆盖任何旧文件）</strong>：为角色卡、预设及世界书统一追加后缀并自动重定向绑定关系，与旧版完全隔离并存</span>
-                </label>
-                <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:2px 6px;">
-                  <span style="font-size:12px;color:#cbd5e1;">并存模式后缀：</span>
-                  <input type="text" class="stcap-search" id="stcap-coexist-suffix" value=" [AGY新版]" style="width:150px;" />
-                  <label style="font-size:12px;color:#cbd5e1;display:inline-flex;align-items:center;gap:5px;cursor:pointer;">
-                    <input type="checkbox" id="stcap-skip-existing-chats" checked />
-                    <span>原位升级时跳过本地已存在的同名聊天（防止覆盖手机新聊进度）</span>
-                  </label>
-                </div>
-              </div>
-
-              <div class="stcap-grid" style="margin-top:8px;">
-                <div class="stcap-section">
-                  <div class="stcap-section-title">👤 角色、正则与脚本</div>
-                  <label class="stcap-item">
-                    <input type="checkbox" id="stcap-res-char" checked />
-                    <span class="stcap-item-label">导入角色卡：${escapeHtml(rawCharName)}</span>
-                  </label>
-                  <label class="stcap-item">
-                    <input type="checkbox" id="stcap-res-gregex" ${gRegex.length ? 'checked' : 'disabled'} />
-                    <span class="stcap-item-label">同步全局正则 (${gRegex.length} 条，按 ID/名称去重更新)</span>
-                  </label>
-                  <label class="stcap-item">
-                    <input type="checkbox" id="stcap-res-th" ${thGlobal.length ? 'checked' : 'disabled'} />
-                    <span class="stcap-item-label">同步全局酒馆助手脚本 (${thGlobal.length} 个，按名称去重)</span>
-                  </label>
-                  <div style="font-size:11px;color:#94a3b8;padding:2px 8px;">角色局部正则 ${sRegex.length} 条随角色卡自动携带。</div>
-                </div>
-
-                <div class="stcap-section">
-                  <div class="stcap-section-head">
-                    <span class="stcap-section-title">🌍 包含的世界书 (${books.length} 本)</span>
-                    <div class="stcap-mini-actions">
-                      <button type="button" class="stcap-mini-btn" id="stcap-res-wb-all">全选</button>
-                      <button type="button" class="stcap-mini-btn" id="stcap-res-wb-none">清空</button>
-                    </div>
-                  </div>
-                  <div class="stcap-list">
-                    ${books.length ? books.map((b, i) => `
-                      <label class="stcap-item">
-                        <input type="checkbox" class="stcap-res-wb" value="${i}" checked />
-                        <span class="stcap-item-label" title="${escapeHtml(b.name)}">${escapeHtml(b.name)}</span>
-                        <span class="stcap-item-sub">${Object.keys(b.data?.entries || {}).length} 条</span>
-                      </label>
-                    `).join('') : '<div style="color:#64748b;font-size:12px;padding:6px;">无附加世界书</div>'}
-                  </div>
-                </div>
-
-                <div class="stcap-section">
-                  <div class="stcap-section-title">🎛️ 包含的预设 (${presets.length} 套)</div>
-                  <div class="stcap-list">
-                    ${presets.length ? presets.map((p, i) => `
-                      <label class="stcap-item">
-                        <input type="checkbox" class="stcap-res-preset" value="${i}" checked />
-                        <span class="stcap-item-label">${escapeHtml(p.name)}</span>
-                      </label>
-                    `).join('') : '<div style="color:#64748b;font-size:12px;padding:6px;">无预设数据</div>'}
-                  </div>
-                </div>
-
-                <div class="stcap-section">
-                  <div class="stcap-section-head">
-                    <span class="stcap-section-title">💬 包含的聊天记录 (${chats.length} 段)</span>
-                    <div class="stcap-mini-actions">
-                      <button type="button" class="stcap-mini-btn" id="stcap-res-chat-all">全选</button>
-                      <button type="button" class="stcap-mini-btn" id="stcap-res-chat-none">清空</button>
-                    </div>
-                  </div>
-                  <div class="stcap-list">
-                    ${chats.length ? chats.map((c, i) => `
-                      <label class="stcap-item">
-                        <input type="checkbox" class="stcap-res-chat" value="${i}" checked />
-                        <span class="stcap-item-label" title="${escapeHtml(c.file_id)}">${escapeHtml(c.file_id)}</span>
-                        <span class="stcap-item-sub">${c.message_count ?? (c.messages?.length || 0)} 条</span>
-                      </label>
-                    `).join('') : '<div style="color:#64748b;font-size:12px;padding:6px;">无聊天记录</div>'}
-                  </div>
-                </div>
-              </div>
-            `;
-            previewEl.querySelector('#stcap-res-wb-all')?.addEventListener('click', () => {
-                previewEl.querySelectorAll('.stcap-res-wb').forEach(c => { c.checked = true; });
-            });
-            previewEl.querySelector('#stcap-res-wb-none')?.addEventListener('click', () => {
-                previewEl.querySelectorAll('.stcap-res-wb').forEach(c => { c.checked = false; });
-            });
-            previewEl.querySelector('#stcap-res-chat-all')?.addEventListener('click', () => {
-                previewEl.querySelectorAll('.stcap-res-chat').forEach(c => { c.checked = true; });
-            });
-            previewEl.querySelector('#stcap-res-chat-none')?.addEventListener('click', () => {
-                previewEl.querySelectorAll('.stcap-res-chat').forEach(c => { c.checked = false; });
-            });
-
-            statusEl.textContent = `解析成功：${rawCharName}（含 ${books.length} 本世界书、${presets.length} 套预设、${chats.length} 段聊天）`;
-            restoreBtn.disabled = false;
-            restoreBtn.onclick = () => executeRestore(cap);
-        } catch (err) {
-            console.error('[ST-Capsule] Import parse error:', err);
-            previewEl.innerHTML = '';
-            statusEl.textContent = `❌ 解析失败：${err?.message || err}`;
-            restoreBtn.disabled = true;
-        }
-    }
-
-    async function executeRestore(cap) {
-        const statusEl = footerEl.querySelector('#stcap-import-status');
-        const restoreBtn = footerEl.querySelector('#stcap-btn-restore');
-        restoreBtn.disabled = true;
-        try {
-            const { extMod, pmMod, wiMod } = await getHostMods();
-            const extension_settings = extMod.extension_settings || ctx.extensionSettings || {};
-            const world_info = wiMod.world_info || {};
-            const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
-
-            const collisionMode = bodyEl.querySelector('input[name="stcap-collision-mode"]:checked')?.value || 'overwrite';
-            const rawSuffix = bodyEl.querySelector('#stcap-coexist-suffix')?.value || ' [AGY新版]';
-            const suffix = collisionMode === 'coexist' ? rawSuffix : '';
-            const skipExistingChats = collisionMode === 'overwrite' && Boolean(bodyEl.querySelector('#stcap-skip-existing-chats')?.checked);
-
-            // Map old worldbook names -> target worldbook names (handles coexist suffix coherently across bindings!)
-            const wbNameMap = new Map();
-            const wbIndices = [...bodyEl.querySelectorAll('.stcap-res-wb:checked')].map(c => Number(c.value));
-            for (let i = 0; i < wbIndices.length; i++) {
-                const idx = wbIndices[i];
-                const wb = cap.worldbooks.books[idx];
-                if (!wb?.name || !wb?.data) continue;
-                const finalWbName = suffix ? `${wb.name}${suffix}` : wb.name;
-                wbNameMap.set(wb.name, finalWbName);
-                statusEl.textContent = `正在写入世界书 (${i + 1}/${wbIndices.length})：${finalWbName}...`;
-                const wbPayload = safeJsonClone(wb.data, wb.data);
-                wbPayload.name = finalWbName;
-                await apiPost('/api/worldinfo/edit', { name: finalWbName, data: wbPayload });
-            }
-
-            const origCharName = cap.character?.name || 'Character';
-            const finalCharName = suffix ? `${origCharName}${suffix}` : origCharName;
-            let targetAvatar = `${sanitizeDownloadName(finalCharName)}.png`;
-
-            // Detect existing character in SillyTavern for in-place overwrite (prevents _1 twin duplicate cards!)
-            const existingChars = ctx.characters || [];
-            const origAvatarKey = String(cap.character?.avatar || '').replace(/\.png$/i, '');
-            const matchedExistingChar = collisionMode === 'overwrite'
-                ? existingChars.find(c =>
-                    (origAvatarKey && String(c.avatar || '').replace(/\.png$/i, '') === origAvatarKey) ||
-                    c.name === origCharName
-                  )
-                : null;
-
-            const activeChatObj = (cap.chats || []).find(c => c.is_active_chat) || cap.chats?.[(cap.chats?.length || 1) - 1];
-            const activeChatId = activeChatObj?.file_id || cap.character?.card?.chat || '';
-
-            if (bodyEl.querySelector('#stcap-res-char')?.checked && cap.character?.card) {
-                statusEl.textContent = `正在导入角色卡：${finalCharName}...`;
-                let pngBytes = cap._raw_png_bytes;
-                if (!pngBytes && cap.character.avatar_png_base64) {
-                    pngBytes = base64ToUint8(cap.character.avatar_png_base64);
-                }
-                if (!pngBytes) {
-                    pngBytes = await createFallbackPngBytes(finalCharName);
-                }
-                const cardCopy = safeJsonClone(cap.character.card, {});
-                cardCopy.name = finalCharName;
-                if (cardCopy.data) {
-                    cardCopy.data.name = finalCharName;
-                    if (cardCopy.data.extensions?.world && wbNameMap.has(cardCopy.data.extensions.world)) {
-                        cardCopy.data.extensions.world = wbNameMap.get(cardCopy.data.extensions.world);
+            if (!fi.files?.[0]) return;
+            selectedFile = fi.files[0];
+            try {
+                const u8 = new Uint8Array(await selectedFile.arrayBuffer());
+                let cardObj = null;
+                if (isZipBytes(u8) || selectedFile.name.toLowerCase().endsWith('.charx')) {
+                    const zf = await readFilesFromZipBytes(u8);
+                    const cj = zf.get('card.json');
+                    if (!cj) throw new Error('CharX 内缺少 card.json');
+                    cardObj = JSON.parse(new TextDecoder('utf-8').decode(cj));
+                } else if (isPngBytes(u8)) {
+                    const chunks = extractPngChunks(u8);
+                    for (const ch of chunks) {
+                        if (ch.name === 'tEXt') {
+                            const dec = decodeTextChunk(ch.data);
+                            if (dec && (dec.keyword === 'ccv3' || dec.keyword === 'chara')) {
+                                cardObj = JSON.parse(base64ToUtf8(dec.text));
+                                break;
+                            }
+                        }
                     }
+                } else {
+                    const parsed = JSON.parse(new TextDecoder('utf-8').decode(u8));
+                    cardObj = parsed.spec === 'st_capsule_v1' ? parsed.character?.card : parsed;
                 }
-                if (activeChatId) cardCopy.chat = activeChatId;
+                const mf = cardObj?.data?.extensions?.st_capsule_manifest;
+                const cName = cardObj?.data?.name || cardObj?.name || selectedFile.name;
+                infoBox.innerHTML = `
+                  <div class="stcap-section">
+                    <div class="stcap-section-title">✅ 已识别卡片：${escapeHtml(cName)}</div>
+                    <div style="font-size:12px;color:#cbd5e1;line-height:1.6;">
+                      ${mf ? `内置唯一前缀：<b>${escapeHtml(mf.prefix)}</b> · 内置世界书：<b>${(mf.all_worldbooks || []).length} 本</b> · 专属预设：<b>${escapeHtml(mf.bound_preset?.name || '无')}</b>` : '普通标准角色卡'}
+                    </div>
+                  </div>
+                `;
+                stEl.textContent = `准备就绪：${cName}`;
+                goBtn.disabled = false;
+            } catch (err) {
+                stEl.textContent = `❌ 文件解析失败：${err?.message || err}`;
+                goBtn.disabled = true;
+            }
+        });
 
-                const cleanChunks = extractPngChunks(pngBytes).filter(ch => {
-                    if (ch.name !== 'tEXt') return true;
-                    const dec = decodeTextChunk(ch.data);
-                    return !dec || !['chara', 'ccv3', 'st_capsule'].includes(dec.keyword.toLowerCase());
-                });
-                const v2Str = JSON.stringify(cardCopy);
-                const iend = cleanChunks.findIndex(c => c.name === 'IEND');
-                cleanChunks.splice(iend >= 0 ? iend : cleanChunks.length, 0, makeTextChunk('chara', utf8ToBase64(v2Str)));
-                const cleanPng = encodePngChunks(cleanChunks);
+        goBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+            goBtn.disabled = true;
+            try {
+                const ctx = getCtx();
+                const ext = selectedFile.name.toLowerCase().endsWith('.charx') ? 'charx'
+                    : selectedFile.name.toLowerCase().endsWith('.png') ? 'png' : 'json';
+                stEl.textContent = '正在向酒馆导入角色卡主体...';
 
                 const fd = new FormData();
-                fd.append('avatar', new Blob([cleanPng], { type: 'image/png' }), targetAvatar);
-                fd.append('file_type', 'png');
-                if (matchedExistingChar?.avatar) {
-                    const preservedKey = String(matchedExistingChar.avatar).replace(/\.png$/i, '');
-                    fd.append('preserved_name', preservedKey);
-                    targetAvatar = matchedExistingChar.avatar;
-                }
-                if (matchedExistingChar?.chat && skipExistingChats) {
-                    fd.append('preserved_chat', matchedExistingChar.chat);
-                } else if (activeChatId) {
-                    fd.append('preserved_chat', activeChatId);
-                }
-
+                fd.append('avatar', selectedFile, selectedFile.name);
+                fd.append('file_type', ext);
                 const headers = ctx.getRequestHeaders ? { ...ctx.getRequestHeaders() } : {};
                 delete headers['Content-Type'];
-                const impResp = await fetch('/api/characters/import', { method: 'POST', headers, body: fd });
-                if (impResp.ok) {
-                    const impJson = await impResp.json();
-                    if (impJson?.file_name) targetAvatar = `${impJson.file_name}.png`;
-                }
-            } else if (matchedExistingChar?.avatar) {
-                targetAvatar = matchedExistingChar.avatar;
-            }
 
-            const rawExtraBooks = cap.worldbooks?.bindings?.extra || [];
-            const mappedExtraBooks = rawExtraBooks.map(b => wbNameMap.get(b) || (suffix ? `${b}${suffix}` : b));
-            if (mappedExtraBooks.length > 0) {
-                const charKey = targetAvatar.replace(/\.png$/i, '');
-                if (typeof wiMod.charSetAuxWorlds === 'function') {
-                    try { wiMod.charSetAuxWorlds(targetAvatar, mappedExtraBooks); } catch {}
+                const resp = await fetch('/api/characters/import', { method: 'POST', headers, body: fd });
+                const rJson = await resp.json();
+                if (!resp.ok || rJson.error || !rJson.file_name) {
+                    throw new Error(rJson.error || '导入角色卡接口返回失败');
                 }
-                if (world_info) {
-                    world_info.charLore = world_info.charLore || [];
-                    const existing = world_info.charLore.find(e => e.name === charKey || e.name === targetAvatar);
-                    if (existing) {
-                        // Replace cleanly instead of merging stale renamed books (e.g. 深海族 -> 深海猎人)
-                        existing.extraBooks = [...new Set(mappedExtraBooks)];
-                    } else {
-                        world_info.charLore.push({ name: charKey, extraBooks: [...new Set(mappedExtraBooks)] });
-                    }
-                    ctx.saveSettingsDebounced?.();
+                const newAvatar = `${rJson.file_name}.png`;
+                if (typeof ctx.getCharacters === 'function') await ctx.getCharacters();
+                const newChid = (ctx.characters || []).findIndex(c => c.avatar === newAvatar);
+                if (newChid >= 0) {
+                    stEl.textContent = '正在自动解包并挂接全部世界书与专属预设...';
+                    await ensureCardBundleInstalled(newChid, { forceReinstall: true, switchPreset: true });
                 }
+                stEl.textContent = `✅ 导入并自动挂接完成：${rJson.file_name}`;
+            } catch (err) {
+                stEl.textContent = `❌ 导入失败：${err?.message || err}`;
+            } finally {
+                goBtn.disabled = false;
             }
-
-            const presetIndices = [...bodyEl.querySelectorAll('.stcap-res-preset:checked')].map(c => Number(c.value));
-            const pm = typeof getPresetManager === 'function' ? getPresetManager() : null;
-            for (const idx of presetIndices) {
-                const p = cap.presets.items[idx];
-                if (p?.name && p?.data && pm?.savePreset) {
-                    const finalPresetName = suffix ? `${p.name}${suffix}` : p.name;
-                    statusEl.textContent = `正在写入预设：${finalPresetName}...`;
-                    const pCopy = safeJsonClone(p.data, p.data);
-                    pCopy.name = finalPresetName;
-                    await pm.savePreset(finalPresetName, pCopy);
-                }
-            }
-
-            if (bodyEl.querySelector('#stcap-res-gregex')?.checked && Array.isArray(cap.regex?.global)) {
-                extension_settings.regex = extension_settings.regex || [];
-                for (const rx of cap.regex.global) {
-                    if (!rx) continue;
-                    const existIdx = extension_settings.regex.findIndex(r =>
-                        (rx.id && r.id === rx.id) ||
-                        (rx.scriptName && r.scriptName === rx.scriptName && r.findRegex === rx.findRegex)
-                    );
-                    if (existIdx >= 0) {
-                        extension_settings.regex[existIdx] = safeJsonClone(rx, rx);
-                    } else {
-                        extension_settings.regex.push(safeJsonClone(rx, rx));
-                    }
-                }
-                ctx.saveSettingsDebounced?.();
-            }
-
-            if (bodyEl.querySelector('#stcap-res-th')?.checked && Array.isArray(cap.tavern_helper?.global_scripts) && cap.tavern_helper.global_scripts.length > 0) {
-                extension_settings.tavern_helper = extension_settings.tavern_helper || {};
-                extension_settings.tavern_helper.script = extension_settings.tavern_helper.script || { enabled: { global: true }, scripts: [] };
-                const curList = Array.isArray(extension_settings.tavern_helper.script.scripts)
-                    ? extension_settings.tavern_helper.script.scripts
-                    : Object.values(extension_settings.tavern_helper.script.scripts || {});
-                for (const sc of cap.tavern_helper.global_scripts) {
-                    if (!sc) continue;
-                    const sKey = sc.id || sc.name;
-                    const eIdx = curList.findIndex(x => (sc.id && x.id === sc.id) || (sc.name && x.name === sc.name));
-                    if (eIdx >= 0) curList[eIdx] = safeJsonClone(sc, sc);
-                    else if (sKey) curList.push(safeJsonClone(sc, sc));
-                }
-                extension_settings.tavern_helper.script.scripts = curList;
-                ctx.saveSettingsDebounced?.();
-            }
-
-            const chatIndices = [...bodyEl.querySelectorAll('.stcap-res-chat:checked')].map(c => Number(c.value));
-            let existingChatIds = new Set();
-            if (skipExistingChats && chatIndices.length > 0) {
-                try {
-                    const existResp = await apiPost('/api/characters/chats', { avatar_url: targetAvatar, simple: true });
-                    if (Array.isArray(existResp)) {
-                        existingChatIds = new Set(existResp.map(c => c.file_id || String(c.file_name || '').replace(/\.jsonl$/i, '')));
-                    }
-                } catch {}
-            }
-
-            let writtenChats = 0;
-            let skippedChats = 0;
-            for (let i = 0; i < chatIndices.length; i++) {
-                const idx = chatIndices[i];
-                const ch = cap.chats[idx];
-                if (!ch?.file_id || !Array.isArray(ch.messages)) continue;
-                if (skipExistingChats && existingChatIds.has(ch.file_id)) {
-                    skippedChats++;
-                    continue;
-                }
-                statusEl.textContent = `正在恢复聊天分支 (${i + 1}/${chatIndices.length})：${ch.file_id}...`;
-                await apiPost('/api/chats/save', {
-                    ch_name: finalCharName,
-                    file_name: ch.file_id,
-                    chat: ch.messages,
-                    avatar_url: targetAvatar,
-                    force: true,
-                });
-                writtenChats++;
-            }
-
-            if (typeof ctx.getCharacters === 'function') await ctx.getCharacters();
-            statusEl.textContent = `✅ 还原完成（${collisionMode === 'coexist' ? `独立并存后缀 "${suffix}"` : '原位覆盖升级'}）：已写入 ${wbIndices.length} 本世界书、${presetIndices.length} 套预设、${writtenChats} 段聊天${skippedChats ? `（已保护跳过 ${skippedChats} 段本地已有聊天）` : ''}。`;
-            if (window.toastr) window.toastr.success('全量胶囊还原成功');
-        } catch (err) {
-            console.error('[ST-Capsule] Restore error:', err);
-            statusEl.textContent = `❌ 还原出错：${err?.message || err}`;
-            if (window.toastr) window.toastr.error(String(err?.message || err));
-        } finally {
-            restoreBtn.disabled = false;
-        }
+        });
     }
 
-    if (activeTab === 'export') await renderExportTab();
-    else renderImportTab();
+    async function renderCleanTab() {
+        bodyEl.innerHTML = `<div style="padding:20px;text-align:center;color:#94a3b8;">正在扫描带前缀/后缀的世界书与预设批次...</div>`;
+        footerEl.innerHTML = `<div class="stcap-status">可在此一键清理旧测试包残留的世界书与预设</div>`;
+
+        const ctx = getCtx();
+        const { pmMod } = await getHostMods();
+        const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
+        const pm = typeof getPresetManager === 'function' ? getPresetManager('openai') : null;
+
+        let worldNames = [];
+        try {
+            const s = await apiPost('/api/settings/get', {});
+            worldNames = s.world_names || [];
+        } catch {}
+        const presetNames = pm?.getAllPresets?.() || [];
+        const chars = ctx.characters || [];
+
+        // Group by either front prefix 【...】 / [...] OR legacy trailing [AGY...]
+        const groups = new Map();
+        const addGroupItem = (tag, kind, itemName) => {
+            if (!tag) return;
+            if (!groups.has(tag)) groups.set(tag, { tag, books: [], presets: [], cards: [] });
+            groups.get(tag)[kind].push(itemName);
+        };
+
+        for (const w of worldNames) {
+            const tag = extractLeadingPrefix(w) || extractTrailingTag(w);
+            if (tag) addGroupItem(tag, 'books', w);
+        }
+        for (const p of presetNames) {
+            const tag = extractLeadingPrefix(p) || extractTrailingTag(p);
+            if (tag) addGroupItem(tag, 'presets', p);
+        }
+        for (const c of chars) {
+            const mfPfx = c?.data?.extensions?.st_capsule_manifest?.prefix;
+            const cName = c?.name || '';
+            const tag = mfPfx || extractLeadingPrefix(cName) || (cName.includes('[AGY1127]') ? '[AGY1127]' : '');
+            if (tag) addGroupItem(tag, 'cards', cName);
+        }
+
+        if (groups.size === 0) {
+            bodyEl.innerHTML = `<div class="stcap-section" style="text-align:center;padding:24px;color:#86efac;">当前酒馆非常干净，没有任何带批次前缀/后缀的世界书或预设。</div>`;
+            return;
+        }
+
+        bodyEl.innerHTML = [...groups.values()].map(g => `
+          <div class="stcap-section">
+            <div class="stcap-section-head">
+              <div>
+                <span class="stcap-section-title">批次标识：${escapeHtml(g.tag)}</span>
+                <span class="stcap-item-sub" style="margin-left:8px;">
+                  ${g.cards.length ? `🟢 关联在用角色卡 (${g.cards.length})` : '🟠 无关联角色卡 (历史残留)'}
+                </span>
+              </div>
+              <button type="button" class="stcap-danger-btn" data-clean-tag="${escapeHtml(g.tag)}">
+                🗑️ 清理该批次 (${g.books.length} 本书 + ${g.presets.length} 预设)
+              </button>
+            </div>
+            <div style="font-size:12px;color:#94a3b8;">
+              世界书 ${g.books.length} 本 · 预设 ${g.presets.length} 套 ${g.cards.length ? `· 角色卡：${escapeHtml(g.cards.join('、'))}（注：若直接去角色列表删除该角色卡，也会自动连带删除这些世界书和预设）` : ''}
+            </div>
+          </div>
+        `).join('');
+
+        bodyEl.querySelectorAll('[data-clean-tag]').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const tag = btn.dataset.cleanTag;
+                const grp = groups.get(tag);
+                if (!grp) return;
+                btn.disabled = true;
+                btn.textContent = '正在清理...';
+                try {
+                    // Force clean regardless of remaining char if user clicked explicit clean button
+                    const res = await deleteBundleAssetsByPrefixOrManifest({
+                        prefix: '',
+                        worldbookNames: grp.books,
+                        presetName: grp.presets[0] || '',
+                        deletedAvatar: '__manual_force__',
+                    });
+                    for (const extraP of grp.presets.slice(1)) {
+                        await apiPost('/api/presets/delete', { name: extraP, apiId: 'openai' }).catch(() => {});
+                    }
+                    if (window.toastr) window.toastr.success(`已清理批次 ${tag}：${res.deletedBooks} 本世界书`);
+                    await renderCleanTab();
+                } catch (err) {
+                    btn.textContent = '清理出错';
+                    console.error(err);
+                }
+            });
+        });
+    }
+
+    if (initialTab === 'export') await renderExportTab();
+    else if (initialTab === 'import') renderImportTab();
+    else await renderCleanTab();
 }
 
 // ============================================================================
-// Resilient Mounting & Document-Level Event Delegation (Luker & ST Safe)
+// 8. Mounting, Event Listeners & Background New-Card Scanner
 // ============================================================================
-function mountExtensionUi() {
+function mountUiControls() {
     ensureCriticalStyles();
 
     const drawerTarget = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
@@ -1732,16 +1997,17 @@ function mountExtensionUi() {
         wrap.innerHTML = `
           <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-              <b>📦 酒馆全量胶囊打包器 (ST Capsule Packer)</b>
+              <b>📦 全内置角色卡打包器 v2.0 (多世界书+预设+删卡全清)</b>
               <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content stcap-drawer-box">
               <div style="color:#94a3b8;line-height:1.5;">
-                将角色卡、当前预设、全局/局部正则、酒馆助手脚本、绑定的多本世界书与所有历史聊天记录一键压入单张 <code>.capsule.png</code> 角色卡或独立 <code>.stcapsule.json</code> 备份文件。
+                将多本绑定世界书、专属预设与正则直接内嵌进单张 <code>.charx</code> / <code>.png</code> 角色卡（统一前置唯一前缀，点卡自动装齐并切换预设，删卡自动连带全删）。
               </div>
               <div class="stcap-btn-row">
-                <button type="button" class="stcap-trigger-btn primary" id="stcap-open-export">📤 打包导出当前角色</button>
-                <button type="button" class="stcap-trigger-btn" id="stcap-open-import">📥 读取 / 还原胶囊</button>
+                <button type="button" class="stcap-trigger-btn" id="stcap-open-export">📤 打包单卡导出</button>
+                <button type="button" class="stcap-trigger-btn" id="stcap-open-import">📥 导入单卡</button>
+                <button type="button" class="stcap-trigger-btn" id="stcap-open-clean">🧹 前缀残留清理</button>
               </div>
             </div>
           </div>
@@ -1757,82 +2023,77 @@ function mountExtensionUi() {
         wandItem.tabIndex = 0;
         wandItem.innerHTML = `
           <div class="fa-solid fa-box-archive extensionsMenuExtensionButton"></div>
-          <span>全量角色胶囊打包 / 还原</span>
+          <span>全内置角色卡打包 / 清理 (v2.0)</span>
         `;
         wandMenu.appendChild(wandItem);
     }
-
-    const exportBtn = document.getElementById('export_button');
-    if (exportBtn && !document.getElementById('stcap-char-btn')) {
-        const charBtn = document.createElement('div');
-        charBtn.id = 'stcap-char-btn';
-        charBtn.className = 'menu_button fa-solid fa-box-archive interactable';
-        charBtn.title = '打包全量角色胶囊 (含预设/正则/多世界书/全部聊天)';
-        charBtn.tabIndex = 0;
-        exportBtn.insertAdjacentElement('afterend', charBtn);
-    }
 }
 
-// Global delegated click listener (survives DOM clones, drawer moves, and prevents drawer auto-close)
-if (!window.__stCapsuleDelegatedBound) {
-    window.__stCapsuleDelegatedBound = true;
+function bindGlobalClicksOnce() {
+    if (window.__stcapV2ClickBound) return;
+    window.__stcapV2ClickBound = true;
     document.addEventListener('click', (e) => {
-        const target = e.target instanceof Element ? e.target : null;
-        if (!target) return;
-
-        const exportTrigger = target.closest('#stcap-open-export, #stcap-char-btn');
-        if (exportTrigger) {
-            e.preventDefault();
-            e.stopPropagation();
+        const t = e.target;
+        if (!(t instanceof Element)) return;
+        if (t.closest('#stcap-open-export') || t.closest('#stcap-wand-item')) {
+            e.preventDefault(); e.stopPropagation();
             openCapsuleModal('export');
-            return;
-        }
-
-        const importTrigger = target.closest('#stcap-open-import');
-        if (importTrigger) {
-            e.preventDefault();
-            e.stopPropagation();
+        } else if (t.closest('#stcap-open-import')) {
+            e.preventDefault(); e.stopPropagation();
             openCapsuleModal('import');
-            return;
-        }
-
-        const wandTrigger = target.closest('#stcap-wand-item');
-        if (wandTrigger) {
-            e.preventDefault();
-            e.stopPropagation();
-            const wm = document.getElementById('extensionsMenu');
-            if (wm) wm.style.display = 'none';
-            openCapsuleModal('export');
+        } else if (t.closest('#stcap-open-clean')) {
+            e.preventDefault(); e.stopPropagation();
+            openCapsuleModal('clean');
         }
     }, true);
 }
 
-function initExtension() {
-    mountExtensionUi();
-    // Re-check mount after delayed UI hydration in Luker
-    setTimeout(mountExtensionUi, 1200);
+async function bootExtensionV2() {
+    window.__ST_CAPSULE_PACKER_V2_ACTIVE__ = true;
+    bindGlobalClicksOnce();
+    mountUiControls();
 
-    const ctx = getCtx();
-    if (ctx.SlashCommandParser && ctx.SlashCommand) {
-        try {
-            ctx.SlashCommandParser.addCommandObject(ctx.SlashCommand.fromProps({
-                name: 'capsule',
-                callback: (_args, val) => {
-                    const mode = String(val || '').trim().toLowerCase() === 'import' ? 'import' : 'export';
-                    openCapsuleModal(mode);
-                    return '';
-                },
-                helpString: '打开酒馆全量胶囊打包/还原工作台（用法：/capsule 或 /capsule import）',
-            }));
-        } catch {}
+    let attempts = 0;
+    const timer = setInterval(() => {
+        attempts++;
+        mountUiControls();
+        if (document.getElementById('st_capsule_packer_container') || attempts > 20) clearInterval(timer);
+    }, 1000);
+
+    try {
+        const ctx = getCtx();
+        const { scriptMod } = await getHostMods();
+        const evSource = ctx.eventSource || scriptMod.eventSource;
+        const evTypes = ctx.eventTypes || ctx.event_types || scriptMod.event_types || {};
+
+        if (evSource && typeof evSource.on === 'function') {
+            if (evTypes.APP_READY) evSource.on(evTypes.APP_READY, () => { mountUiControls(); handleChatChangedAutoHooks(); });
+            if (evTypes.CHAT_CHANGED) evSource.on(evTypes.CHAT_CHANGED, handleChatChangedAutoHooks);
+            if (evTypes.CHARACTER_DELETED) evSource.on(evTypes.CHARACTER_DELETED, handleCharacterDeletedEvent);
+        }
+
+        // Also scan newly imported characters right after native Character Import!
+        let knownCharCount = (ctx.characters || []).length;
+        setInterval(() => {
+            const curChars = ctx.characters || [];
+            if (curChars.length > knownCharCount) {
+                // Check newly added character(s) at the end or any un-installed v2 card
+                for (let i = 0; i < curChars.length; i++) {
+                    const mf = curChars[i]?.data?.extensions?.st_capsule_manifest;
+                    if (mf?.spec === BUNDLE_SPEC && !installedSessionSignatures.has(curChars[i].avatar)) {
+                        ensureCardBundleInstalled(i, { switchPreset: ctx.characterId === i });
+                    }
+                }
+            }
+            knownCharCount = curChars.length;
+        }, 2500);
+    } catch (err) {
+        console.warn('[ST-Capsule v2] Event hook setup warning:', err);
     }
-    console.log(`[${EXT_ID}] v1.2.0 initialized (LukerAndroid=${isLukerAndroidApp()}).`);
 }
 
-if (typeof jQuery !== 'undefined') {
-    jQuery(() => initExtension());
-} else if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initExtension);
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootExtensionV2);
 } else {
-    initExtension();
+    bootExtensionV2();
 }
