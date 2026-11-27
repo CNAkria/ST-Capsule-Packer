@@ -1379,28 +1379,67 @@ async function openCapsuleModal(initialTab = 'export') {
             const gRegex = cap.regex?.global || [];
             const sRegex = cap.regex?.scoped || [];
 
+            const thGlobal = cap.tavern_helper?.global_scripts || [];
+            const existingChars = ctx.characters || [];
+            const rawCharName = cap.character?.name || 'Character';
+            const rawAvatarKey = String(cap.character?.avatar || '').replace(/\.png$/i, '');
+            const collidingChar = existingChars.find(c =>
+                (rawAvatarKey && String(c.avatar || '').replace(/\.png$/i, '') === rawAvatarKey) ||
+                c.name === rawCharName
+            );
+
             previewEl.innerHTML = `
+              <div class="stcap-section" style="margin-top:8px;border-color:rgba(250,204,21,0.45);background:rgba(30,27,18,0.65);">
+                <div class="stcap-section-title">🛡️ 同名文件冲突处理策略 ${collidingChar ? `<span class="stcap-badge warn">检测到酒馆已有同名角色：${escapeHtml(collidingChar.name)}</span>` : `<span class="stcap-badge">未检测到角色重名</span>`}</div>
+                <label class="stcap-item">
+                  <input type="radio" name="stcap-collision-mode" value="overwrite" checked />
+                  <span class="stcap-item-label" style="white-space:normal;"><strong>🔄 原位覆盖升级（推荐更新设定时使用）</strong>：精准覆盖同名角色卡（不产生 <code>_1</code> 分身卡）、覆盖更新同名世界书与预设，并清理旧废案世界书绑定</span>
+                </label>
+                <label class="stcap-item">
+                  <input type="radio" name="stcap-collision-mode" value="coexist" />
+                  <span class="stcap-item-label" style="white-space:normal;"><strong>🆕 加后缀独立并存（不覆盖任何旧文件）</strong>：为角色卡、预设及世界书统一追加后缀并自动重定向绑定关系，与旧版完全隔离并存</span>
+                </label>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:2px 6px;">
+                  <span style="font-size:12px;color:#cbd5e1;">并存模式后缀：</span>
+                  <input type="text" class="stcap-search" id="stcap-coexist-suffix" value=" [AGY新版]" style="width:150px;" />
+                  <label style="font-size:12px;color:#cbd5e1;display:inline-flex;align-items:center;gap:5px;cursor:pointer;">
+                    <input type="checkbox" id="stcap-skip-existing-chats" checked />
+                    <span>原位升级时跳过本地已存在的同名聊天（防止覆盖手机新聊进度）</span>
+                  </label>
+                </div>
+              </div>
+
               <div class="stcap-grid" style="margin-top:8px;">
                 <div class="stcap-section">
-                  <div class="stcap-section-title">👤 角色与基础项</div>
+                  <div class="stcap-section-title">👤 角色、正则与脚本</div>
                   <label class="stcap-item">
                     <input type="checkbox" id="stcap-res-char" checked />
-                    <span class="stcap-item-label">导入角色卡：${escapeHtml(cap.character?.name || '未知')}</span>
+                    <span class="stcap-item-label">导入角色卡：${escapeHtml(rawCharName)}</span>
                   </label>
                   <label class="stcap-item">
                     <input type="checkbox" id="stcap-res-gregex" ${gRegex.length ? 'checked' : 'disabled'} />
-                    <span class="stcap-item-label">合并全局正则 (${gRegex.length} 条，按 ID 去重)</span>
+                    <span class="stcap-item-label">同步全局正则 (${gRegex.length} 条，按 ID/名称去重更新)</span>
                   </label>
-                  <div style="font-size:11px;color:#94a3b8;padding:4px 8px;">角色局部正则 ${sRegex.length} 条随角色卡自动携带。</div>
+                  <label class="stcap-item">
+                    <input type="checkbox" id="stcap-res-th" ${thGlobal.length ? 'checked' : 'disabled'} />
+                    <span class="stcap-item-label">同步全局酒馆助手脚本 (${thGlobal.length} 个，按名称去重)</span>
+                  </label>
+                  <div style="font-size:11px;color:#94a3b8;padding:2px 8px;">角色局部正则 ${sRegex.length} 条随角色卡自动携带。</div>
                 </div>
 
                 <div class="stcap-section">
-                  <div class="stcap-section-title">🌍 包含的世界书 (${books.length} 本)</div>
+                  <div class="stcap-section-head">
+                    <span class="stcap-section-title">🌍 包含的世界书 (${books.length} 本)</span>
+                    <div class="stcap-mini-actions">
+                      <button type="button" class="stcap-mini-btn" id="stcap-res-wb-all">全选</button>
+                      <button type="button" class="stcap-mini-btn" id="stcap-res-wb-none">清空</button>
+                    </div>
+                  </div>
                   <div class="stcap-list">
                     ${books.length ? books.map((b, i) => `
                       <label class="stcap-item">
                         <input type="checkbox" class="stcap-res-wb" value="${i}" checked />
-                        <span class="stcap-item-label">${escapeHtml(b.name)}</span>
+                        <span class="stcap-item-label" title="${escapeHtml(b.name)}">${escapeHtml(b.name)}</span>
                         <span class="stcap-item-sub">${Object.keys(b.data?.entries || {}).length} 条</span>
                       </label>
                     `).join('') : '<div style="color:#64748b;font-size:12px;padding:6px;">无附加世界书</div>'}
@@ -1420,12 +1459,18 @@ async function openCapsuleModal(initialTab = 'export') {
                 </div>
 
                 <div class="stcap-section">
-                  <div class="stcap-section-title">💬 包含的聊天记录 (${chats.length} 段)</div>
+                  <div class="stcap-section-head">
+                    <span class="stcap-section-title">💬 包含的聊天记录 (${chats.length} 段)</span>
+                    <div class="stcap-mini-actions">
+                      <button type="button" class="stcap-mini-btn" id="stcap-res-chat-all">全选</button>
+                      <button type="button" class="stcap-mini-btn" id="stcap-res-chat-none">清空</button>
+                    </div>
+                  </div>
                   <div class="stcap-list">
                     ${chats.length ? chats.map((c, i) => `
                       <label class="stcap-item">
                         <input type="checkbox" class="stcap-res-chat" value="${i}" checked />
-                        <span class="stcap-item-label">${escapeHtml(c.file_id)}</span>
+                        <span class="stcap-item-label" title="${escapeHtml(c.file_id)}">${escapeHtml(c.file_id)}</span>
                         <span class="stcap-item-sub">${c.message_count ?? (c.messages?.length || 0)} 条</span>
                       </label>
                     `).join('') : '<div style="color:#64748b;font-size:12px;padding:6px;">无聊天记录</div>'}
@@ -1433,7 +1478,20 @@ async function openCapsuleModal(initialTab = 'export') {
                 </div>
               </div>
             `;
-            statusEl.textContent = `解析成功：${cap.character?.name || file.name}（导出时间：${cap.exported_at || '未知'}）`;
+            previewEl.querySelector('#stcap-res-wb-all')?.addEventListener('click', () => {
+                previewEl.querySelectorAll('.stcap-res-wb').forEach(c => { c.checked = true; });
+            });
+            previewEl.querySelector('#stcap-res-wb-none')?.addEventListener('click', () => {
+                previewEl.querySelectorAll('.stcap-res-wb').forEach(c => { c.checked = false; });
+            });
+            previewEl.querySelector('#stcap-res-chat-all')?.addEventListener('click', () => {
+                previewEl.querySelectorAll('.stcap-res-chat').forEach(c => { c.checked = true; });
+            });
+            previewEl.querySelector('#stcap-res-chat-none')?.addEventListener('click', () => {
+                previewEl.querySelectorAll('.stcap-res-chat').forEach(c => { c.checked = false; });
+            });
+
+            statusEl.textContent = `解析成功：${rawCharName}（含 ${books.length} 本世界书、${presets.length} 套预设、${chats.length} 段聊天）`;
             restoreBtn.disabled = false;
             restoreBtn.onclick = () => executeRestore(cap);
         } catch (err) {
@@ -1454,30 +1512,68 @@ async function openCapsuleModal(initialTab = 'export') {
             const world_info = wiMod.world_info || {};
             const getPresetManager = pmMod.getPresetManager || ctx.getPresetManager;
 
+            const collisionMode = bodyEl.querySelector('input[name="stcap-collision-mode"]:checked')?.value || 'overwrite';
+            const rawSuffix = bodyEl.querySelector('#stcap-coexist-suffix')?.value || ' [AGY新版]';
+            const suffix = collisionMode === 'coexist' ? rawSuffix : '';
+            const skipExistingChats = collisionMode === 'overwrite' && Boolean(bodyEl.querySelector('#stcap-skip-existing-chats')?.checked);
+
+            // Map old worldbook names -> target worldbook names (handles coexist suffix coherently across bindings!)
+            const wbNameMap = new Map();
             const wbIndices = [...bodyEl.querySelectorAll('.stcap-res-wb:checked')].map(c => Number(c.value));
-            for (const idx of wbIndices) {
+            for (let i = 0; i < wbIndices.length; i++) {
+                const idx = wbIndices[i];
                 const wb = cap.worldbooks.books[idx];
                 if (!wb?.name || !wb?.data) continue;
-                statusEl.textContent = `正在写入世界书：${wb.name}...`;
-                await apiPost('/api/worldinfo/edit', { name: wb.name, data: wb.data });
+                const finalWbName = suffix ? `${wb.name}${suffix}` : wb.name;
+                wbNameMap.set(wb.name, finalWbName);
+                statusEl.textContent = `正在写入世界书 (${i + 1}/${wbIndices.length})：${finalWbName}...`;
+                const wbPayload = safeJsonClone(wb.data, wb.data);
+                wbPayload.name = finalWbName;
+                await apiPost('/api/worldinfo/edit', { name: finalWbName, data: wbPayload });
             }
 
-            let targetAvatar = cap.character?.avatar || `${sanitizeDownloadName(cap.character?.name || 'Character')}.png`;
+            const origCharName = cap.character?.name || 'Character';
+            const finalCharName = suffix ? `${origCharName}${suffix}` : origCharName;
+            let targetAvatar = `${sanitizeDownloadName(finalCharName)}.png`;
+
+            // Detect existing character in SillyTavern for in-place overwrite (prevents _1 twin duplicate cards!)
+            const existingChars = ctx.characters || [];
+            const origAvatarKey = String(cap.character?.avatar || '').replace(/\.png$/i, '');
+            const matchedExistingChar = collisionMode === 'overwrite'
+                ? existingChars.find(c =>
+                    (origAvatarKey && String(c.avatar || '').replace(/\.png$/i, '') === origAvatarKey) ||
+                    c.name === origCharName
+                  )
+                : null;
+
+            const activeChatObj = (cap.chats || []).find(c => c.is_active_chat) || cap.chats?.[(cap.chats?.length || 1) - 1];
+            const activeChatId = activeChatObj?.file_id || cap.character?.card?.chat || '';
+
             if (bodyEl.querySelector('#stcap-res-char')?.checked && cap.character?.card) {
-                statusEl.textContent = `正在导入角色卡：${cap.character.name}...`;
+                statusEl.textContent = `正在导入角色卡：${finalCharName}...`;
                 let pngBytes = cap._raw_png_bytes;
                 if (!pngBytes && cap.character.avatar_png_base64) {
                     pngBytes = base64ToUint8(cap.character.avatar_png_base64);
                 }
                 if (!pngBytes) {
-                    pngBytes = await createFallbackPngBytes(cap.character.name);
+                    pngBytes = await createFallbackPngBytes(finalCharName);
                 }
+                const cardCopy = safeJsonClone(cap.character.card, {});
+                cardCopy.name = finalCharName;
+                if (cardCopy.data) {
+                    cardCopy.data.name = finalCharName;
+                    if (cardCopy.data.extensions?.world && wbNameMap.has(cardCopy.data.extensions.world)) {
+                        cardCopy.data.extensions.world = wbNameMap.get(cardCopy.data.extensions.world);
+                    }
+                }
+                if (activeChatId) cardCopy.chat = activeChatId;
+
                 const cleanChunks = extractPngChunks(pngBytes).filter(ch => {
                     if (ch.name !== 'tEXt') return true;
                     const dec = decodeTextChunk(ch.data);
                     return !dec || !['chara', 'ccv3', 'st_capsule'].includes(dec.keyword.toLowerCase());
                 });
-                const v2Str = JSON.stringify(cap.character.card);
+                const v2Str = JSON.stringify(cardCopy);
                 const iend = cleanChunks.findIndex(c => c.name === 'IEND');
                 cleanChunks.splice(iend >= 0 ? iend : cleanChunks.length, 0, makeTextChunk('chara', utf8ToBase64(v2Str)));
                 const cleanPng = encodePngChunks(cleanChunks);
@@ -1485,6 +1581,17 @@ async function openCapsuleModal(initialTab = 'export') {
                 const fd = new FormData();
                 fd.append('avatar', new Blob([cleanPng], { type: 'image/png' }), targetAvatar);
                 fd.append('file_type', 'png');
+                if (matchedExistingChar?.avatar) {
+                    const preservedKey = String(matchedExistingChar.avatar).replace(/\.png$/i, '');
+                    fd.append('preserved_name', preservedKey);
+                    targetAvatar = matchedExistingChar.avatar;
+                }
+                if (matchedExistingChar?.chat && skipExistingChats) {
+                    fd.append('preserved_chat', matchedExistingChar.chat);
+                } else if (activeChatId) {
+                    fd.append('preserved_chat', activeChatId);
+                }
+
                 const headers = ctx.getRequestHeaders ? { ...ctx.getRequestHeaders() } : {};
                 delete headers['Content-Type'];
                 const impResp = await fetch('/api/characters/import', { method: 'POST', headers, body: fd });
@@ -1492,21 +1599,25 @@ async function openCapsuleModal(initialTab = 'export') {
                     const impJson = await impResp.json();
                     if (impJson?.file_name) targetAvatar = `${impJson.file_name}.png`;
                 }
+            } else if (matchedExistingChar?.avatar) {
+                targetAvatar = matchedExistingChar.avatar;
             }
 
-            const extraBooks = cap.worldbooks?.bindings?.extra || [];
-            if (extraBooks.length > 0) {
+            const rawExtraBooks = cap.worldbooks?.bindings?.extra || [];
+            const mappedExtraBooks = rawExtraBooks.map(b => wbNameMap.get(b) || (suffix ? `${b}${suffix}` : b));
+            if (mappedExtraBooks.length > 0) {
                 const charKey = targetAvatar.replace(/\.png$/i, '');
                 if (typeof wiMod.charSetAuxWorlds === 'function') {
-                    try { wiMod.charSetAuxWorlds(targetAvatar, extraBooks); } catch {}
+                    try { wiMod.charSetAuxWorlds(targetAvatar, mappedExtraBooks); } catch {}
                 }
                 if (world_info) {
                     world_info.charLore = world_info.charLore || [];
-                    const existing = world_info.charLore.find(e => e.name === charKey);
+                    const existing = world_info.charLore.find(e => e.name === charKey || e.name === targetAvatar);
                     if (existing) {
-                        existing.extraBooks = [...new Set([...(existing.extraBooks || []), ...extraBooks])];
+                        // Replace cleanly instead of merging stale renamed books (e.g. 深海族 -> 深海猎人)
+                        existing.extraBooks = [...new Set(mappedExtraBooks)];
                     } else {
-                        world_info.charLore.push({ name: charKey, extraBooks: [...extraBooks] });
+                        world_info.charLore.push({ name: charKey, extraBooks: [...new Set(mappedExtraBooks)] });
                     }
                     ctx.saveSettingsDebounced?.();
                 }
@@ -1517,38 +1628,82 @@ async function openCapsuleModal(initialTab = 'export') {
             for (const idx of presetIndices) {
                 const p = cap.presets.items[idx];
                 if (p?.name && p?.data && pm?.savePreset) {
-                    statusEl.textContent = `正在写入预设：${p.name}...`;
-                    await pm.savePreset(p.name, p.data);
+                    const finalPresetName = suffix ? `${p.name}${suffix}` : p.name;
+                    statusEl.textContent = `正在写入预设：${finalPresetName}...`;
+                    const pCopy = safeJsonClone(p.data, p.data);
+                    pCopy.name = finalPresetName;
+                    await pm.savePreset(finalPresetName, pCopy);
                 }
             }
 
             if (bodyEl.querySelector('#stcap-res-gregex')?.checked && Array.isArray(cap.regex?.global)) {
                 extension_settings.regex = extension_settings.regex || [];
-                const existingIds = new Set(extension_settings.regex.map(r => r.id));
                 for (const rx of cap.regex.global) {
-                    if (rx && !existingIds.has(rx.id)) {
-                        extension_settings.regex.push(rx);
+                    if (!rx) continue;
+                    const existIdx = extension_settings.regex.findIndex(r =>
+                        (rx.id && r.id === rx.id) ||
+                        (rx.scriptName && r.scriptName === rx.scriptName && r.findRegex === rx.findRegex)
+                    );
+                    if (existIdx >= 0) {
+                        extension_settings.regex[existIdx] = safeJsonClone(rx, rx);
+                    } else {
+                        extension_settings.regex.push(safeJsonClone(rx, rx));
                     }
                 }
                 ctx.saveSettingsDebounced?.();
             }
 
+            if (bodyEl.querySelector('#stcap-res-th')?.checked && Array.isArray(cap.tavern_helper?.global_scripts) && cap.tavern_helper.global_scripts.length > 0) {
+                extension_settings.tavern_helper = extension_settings.tavern_helper || {};
+                extension_settings.tavern_helper.script = extension_settings.tavern_helper.script || { enabled: { global: true }, scripts: [] };
+                const curList = Array.isArray(extension_settings.tavern_helper.script.scripts)
+                    ? extension_settings.tavern_helper.script.scripts
+                    : Object.values(extension_settings.tavern_helper.script.scripts || {});
+                for (const sc of cap.tavern_helper.global_scripts) {
+                    if (!sc) continue;
+                    const sKey = sc.id || sc.name;
+                    const eIdx = curList.findIndex(x => (sc.id && x.id === sc.id) || (sc.name && x.name === sc.name));
+                    if (eIdx >= 0) curList[eIdx] = safeJsonClone(sc, sc);
+                    else if (sKey) curList.push(safeJsonClone(sc, sc));
+                }
+                extension_settings.tavern_helper.script.scripts = curList;
+                ctx.saveSettingsDebounced?.();
+            }
+
             const chatIndices = [...bodyEl.querySelectorAll('.stcap-res-chat:checked')].map(c => Number(c.value));
-            for (const idx of chatIndices) {
+            let existingChatIds = new Set();
+            if (skipExistingChats && chatIndices.length > 0) {
+                try {
+                    const existResp = await apiPost('/api/characters/chats', { avatar_url: targetAvatar, simple: true });
+                    if (Array.isArray(existResp)) {
+                        existingChatIds = new Set(existResp.map(c => c.file_id || String(c.file_name || '').replace(/\.jsonl$/i, '')));
+                    }
+                } catch {}
+            }
+
+            let writtenChats = 0;
+            let skippedChats = 0;
+            for (let i = 0; i < chatIndices.length; i++) {
+                const idx = chatIndices[i];
                 const ch = cap.chats[idx];
                 if (!ch?.file_id || !Array.isArray(ch.messages)) continue;
-                statusEl.textContent = `正在恢复聊天分支：${ch.file_id}...`;
+                if (skipExistingChats && existingChatIds.has(ch.file_id)) {
+                    skippedChats++;
+                    continue;
+                }
+                statusEl.textContent = `正在恢复聊天分支 (${i + 1}/${chatIndices.length})：${ch.file_id}...`;
                 await apiPost('/api/chats/save', {
-                    ch_name: cap.character?.name || 'Character',
+                    ch_name: finalCharName,
                     file_name: ch.file_id,
                     chat: ch.messages,
                     avatar_url: targetAvatar,
                     force: true,
                 });
+                writtenChats++;
             }
 
             if (typeof ctx.getCharacters === 'function') await ctx.getCharacters();
-            statusEl.textContent = `✅ 还原完成：已写入 ${wbIndices.length} 本世界书、${presetIndices.length} 套预设、${chatIndices.length} 段聊天记录。`;
+            statusEl.textContent = `✅ 还原完成（${collisionMode === 'coexist' ? `独立并存后缀 "${suffix}"` : '原位覆盖升级'}）：已写入 ${wbIndices.length} 本世界书、${presetIndices.length} 套预设、${writtenChats} 段聊天${skippedChats ? `（已保护跳过 ${skippedChats} 段本地已有聊天）` : ''}。`;
             if (window.toastr) window.toastr.success('全量胶囊还原成功');
         } catch (err) {
             console.error('[ST-Capsule] Restore error:', err);
